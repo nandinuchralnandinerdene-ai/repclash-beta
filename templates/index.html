@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>REPCLASH</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+  <header>
+    <div id="brandBlock">
+      <h1>💪 REPCLASH</h1>
+      <span id="brandTagline">Your reps. Their reps. One winner.</span>
+    </div>
+    <div id="userBadge" class="hidden">
+      <nav id="mainNav">
+        <button id="navHomeBtn" class="navTab active">🏠 Home</button>
+        <button id="navFriendsBtn" class="navTab">👥 Friends</button>
+        <button id="navRpgBtn" class="navTab">⚔️ RPG</button>
+        <button id="navProfileBtn" class="navTab">👤 Profile</button>
+      </nav>
+      <button id="notifBellBtn" class="linkBtn">🔔<span id="notifUnreadBadge" class="hidden">0</span></button>
+      <span id="userName"></span> · Elo <strong id="userElo"></strong>
+      <button id="logoutBtn" class="linkBtn">Log Out</button>
+    </div>
+  </header>
+
+  <div id="connectionBanner" class="hidden">⚠️ Connection error — retrying…</div>
+  <div id="noticeBanner" class="hidden"></div>
+  <div id="achievementToast" class="hidden">
+    <div class="achievementToastIcon" id="achievementToastIcon">🏆</div>
+    <div class="achievementToastText">
+      <div class="achievementToastTitle">ACHIEVEMENT UNLOCKED</div>
+      <div class="achievementToastName" id="achievementToastName"></div>
+      <div class="achievementToastDesc" id="achievementToastDesc"></div>
+      <div class="achievementToastXp" id="achievementToastXp"></div>
+    </div>
+  </div>
+
+  <main>
+
+    <!-- 1. Login / Signup -->
+    <section id="loginScreen" class="card">
+      <div class="authTabs">
+        <button id="tabLoginBtn" class="authTab active">Log In</button>
+        <button id="tabSignupBtn" class="authTab">Sign Up</button>
+      </div>
+
+      <div id="loginForm">
+        <h2>Log In</h2>
+        <input id="loginUsernameInput" type="text" placeholder="Username" maxlength="20">
+        <input id="loginPasswordInput" type="password" placeholder="Password">
+        <button id="loginBtn">Log In</button>
+        <p id="loginError" class="error"></p>
+      </div>
+
+      <div id="signupForm" class="hidden">
+        <h2>Sign Up</h2>
+        <input id="signupUsernameInput" type="text" placeholder="Username" maxlength="20">
+        <input id="signupPasswordInput" type="password" placeholder="Password (6+ characters)">
+        <button id="signupBtn">Sign Up</button>
+        <p id="signupError" class="error"></p>
+      </div>
+    </section>
+
+    <!-- 2. Lobby -->
+    <section id="lobbyScreen" class="card cardWide hidden">
+      <div class="heroKicker">COMPETE. CLIMB. CONQUER.</div>
+      <h2 class="heroTitle">READY FOR YOUR NEXT DUEL?</h2>
+      <p class="hint heroSub">See who can do more push-ups in 60 seconds. Win and your Elo goes up, lose and it goes down.</p>
+      <button id="findMatchBtn">🔎 FIND OPPONENT</button>
+
+      <div id="heroStatsRow">
+        <div class="heroStat">
+          <div class="heroStatLabel">ELO</div>
+          <div class="heroStatValue" id="heroEloValue">—</div>
+        </div>
+        <div class="heroStat">
+          <div class="heroStatLabel">🌎 GLOBAL</div>
+          <div class="heroStatValue" id="heroGlobalRankValue">—</div>
+        </div>
+        <div class="heroStat" id="heroCountryStatBox">
+          <div class="heroStatLabel" id="heroCountryLabel">COUNTRY</div>
+          <div class="heroStatValue" id="heroCountryRankValue">—</div>
+        </div>
+      </div>
+      <p class="hint" id="heroPlayerCountLine"></p>
+
+      <!-- Optional — only shown when the user has a genuinely unfinished RPG
+           encounter. Purely informational; never auto-opens the battle. -->
+      <div id="homeRpgContinueCard" class="monsterCard hidden">
+        <div class="homeRpgContinueLabel hint">RPG · Unfinished Battle</div>
+        <div class="homeRpgContinueRow">
+          <div class="monsterCardIcon" id="homeRpgContinueIcon">👺</div>
+          <div>
+            <div class="monsterCardName" id="homeRpgContinueName">Monster</div>
+            <div class="hint" id="homeRpgContinueHp">0 / 0 HP</div>
+          </div>
+          <button id="homeRpgContinueBtn">Continue</button>
+        </div>
+      </div>
+
+      <div id="leaderboardBox">
+        <div class="leaderboardTabsRow">
+          <h3>Leaderboard</h3>
+          <p id="myRankLine" class="hint"></p>
+        </div>
+        <div id="leaderboardTabs">
+          <button class="lbTab active" data-tab="all">All Time</button>
+          <button class="lbTab" data-tab="weekly">7 Days</button>
+          <button class="lbTab" data-tab="monthly">30 Days</button>
+          <button class="lbTab" data-tab="friends">Friends</button>
+        </div>
+        <ol id="leaderboardList"></ol>
+      </div>
+    </section>
+
+    <!-- 2g. RPG Home -->
+    <section id="rpgHomeScreen" class="card cardWide hidden">
+      <h2>RPG</h2>
+      <div id="rpgPlayerHeader">
+        <div class="rpgStatBox">
+          <div class="statLabel">RPG LEVEL</div>
+          <div class="statValue" id="rpgLevelValue">1</div>
+          <div class="hint" id="rpgRankValue">Novice</div>
+        </div>
+        <div class="rpgStatBox">
+          <div class="statLabel">GOLD</div>
+          <div class="statValue" id="rpgGoldValue">0</div>
+        </div>
+        <div class="rpgStatBox">
+          <div class="statLabel">DEFEATED</div>
+          <div class="statValue" id="rpgDefeatedValue">0</div>
+        </div>
+      </div>
+      <div id="rpgXpBarTrack"><div id="rpgXpBarFill"></div></div>
+      <p class="hint" id="rpgXpLabel">0 / 200 XP</p>
+
+      <div id="rpgContinueBattleBox" class="monsterCard hidden"></div>
+
+      <h3>Monsters</h3>
+      <div id="monsterGrid"></div>
+    </section>
+
+    <!-- 2h. RPG Battle (TIMELESS — no countdown, no timer; runs until victory or Leave Battle) -->
+    <section id="rpgBattleScreen" class="card cardWide hidden">
+      <div id="battleMonsterHeader">
+        <span id="battleMonsterIcon">👺</span>
+        <span id="battleMonsterName">Monster</span>
+        <span id="rpgDamagePopup"></span>
+        <span id="rpgFinalHitBanner" class="hidden">FINAL HIT!</span>
+        <span id="rpgDefeatedBanner" class="hidden">DEFEATED!</span>
+      </div>
+      <div id="monsterHpBarTrack"><div id="monsterHpBarFill"></div></div>
+      <p class="hint"><span id="monsterHpText">0 / 0</span> HP</p>
+
+      <div id="battleTopRow">
+        <p id="rpgBattleStatusText">⚔️ Battle in progress — keep going until the monster is defeated.</p>
+        <button id="rpgSoundToggleBtn" class="linkBtn">🔊 Sound</button>
+      </div>
+
+      <div id="rpgCameraWrap">
+        <video id="rpgCameraVideo" autoplay playsinline muted></video>
+        <canvas id="rpgCameraCanvas"></canvas>
+        <div id="rpgCameraStatus">📷 Starting camera…</div>
+      </div>
+
+      <div id="rpgRepCount">0</div>
+      <p class="hint" id="rpgDetectionHint">Stand sideways in front of the camera.</p>
+      <button id="rpgManualAddBtn" class="secondary">➕ Add Rep Manually (if camera fails)</button>
+      <button id="rpgFleeBtn" class="secondary">🏃 Leave Battle (progress is saved)</button>
+    </section>
+
+    <!-- 2j. Camera Setup Onboarding (shown once before first AI exercise) -->
+    <section id="cameraSetupScreen" class="card hidden">
+      <h2>📷 Camera Setup</h2>
+      <p class="hint">Let's make sure your camera can track your push-ups correctly.</p>
+
+      <ul id="cameraSetupChecklist">
+        <li>Stand <strong>sideways</strong> to the camera</li>
+        <li>Position the camera so your <strong>entire body</strong> is visible</li>
+        <li>Keep head, hips, knees and feet in frame</li>
+        <li>Use good lighting</li>
+        <li>Keep the camera stable</li>
+      </ul>
+
+      <div id="setupCameraWrap">
+        <video id="setupCameraVideo" autoplay playsinline muted></video>
+        <canvas id="setupCameraCanvas"></canvas>
+        <div id="setupCameraStatus">📷 Starting camera…</div>
+      </div>
+
+      <div id="setupLiveChecks">
+        <div class="setupCheckRow" id="setupCheckBody">🔴 Body detected</div>
+        <div class="setupCheckRow" id="setupCheckFullBody">🔴 Full body visible</div>
+      </div>
+      <p class="hint">Side view can't be auto-detected — just make sure you're standing sideways.</p>
+
+      <button id="setupContinueBtn">Continue</button>
+    </section>
+
+    <!-- 2i. RPG Result -->
+    <section id="rpgResultScreen" class="card hidden">
+      <h2 id="rpgResultTitle">VICTORY!</h2>
+      <p id="rpgResultSubtitle" class="hint"></p>
+      <div id="rpgResultRewards" class="hidden">
+        <p id="rpgResultXp">+0 XP</p>
+        <p id="rpgResultGold">+0 Gold</p>
+      </div>
+      <p id="rpgLevelUpBanner" class="badge hidden"></p>
+      <div class="resultRow">
+        <div class="resultPlayer">
+          <div class="hint">DAMAGE DEALT</div>
+          <div id="rpgResultDamage" class="bigNum">0</div>
+        </div>
+        <div class="resultPlayer">
+          <div class="hint">TOTAL DEFEATED</div>
+          <div id="rpgResultDefeated" class="bigNum">0</div>
+        </div>
+      </div>
+      <button id="rpgBattleAgainBtn">⚔️ Battle Again</button>
+      <button id="rpgBackToHomeBtn" class="secondary">🏠 Back to RPG</button>
+    </section>
+
+    <!-- 2c. Friends -->
+    <section id="friendsScreen" class="card cardWide hidden">
+      <h2>Friends</h2>
+
+      <div id="playerSearchBox">
+        <input id="playerSearchInput" type="text" placeholder="Search players...">
+        <ul id="playerSearchResults"></ul>
+      </div>
+
+      <div id="friendRequestsBox">
+        <h3>Friend Requests</h3>
+        <div id="incomingRequestsList"></div>
+        <div id="outgoingRequestsList"></div>
+      </div>
+
+      <h3>Friends (<span id="friendsCount">0</span>)</h3>
+      <ul id="friendsList"></ul>
+
+      <h3>Friend Activity</h3>
+      <ul id="friendsActivityList"></ul>
+    </section>
+
+    <!-- 2d. Public player profile (viewing someone else) -->
+    <section id="publicProfileScreen" class="card cardWide hidden">
+      <button id="backFromPublicProfileBtn" class="linkBtn">← Back</button>
+      <div id="publicProfileHeader">
+        <div id="publicProfileAvatar">🙂</div>
+        <div id="publicProfileNameBlock">
+          <div id="publicProfileUsername">—</div>
+          <div id="publicProfileCountry" class="hidden"></div>
+          <div id="publicProfileRankBadge">—</div>
+        </div>
+      </div>
+      <p id="publicProfileBio" class="hint hidden"></p>
+      <div id="publicProfileStats">
+        <div class="statBox">
+          <div class="statLabel">Elo</div>
+          <div class="statValue" id="publicProfileElo">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Wins</div>
+          <div class="statValue" id="publicProfileWins">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Losses</div>
+          <div class="statValue" id="publicProfileLosses">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Personal Best</div>
+          <div class="statValue" id="publicProfileBest">—</div>
+        </div>
+      </div>
+      <div id="publicProfileAchievements"></div>
+      <div id="publicProfileActionArea"></div>
+    </section>
+
+    <!-- 2e. Notifications dropdown panel -->
+    <div id="notifPanel" class="hidden">
+      <div id="notifPanelHeader">
+        <span>Notifications</span>
+        <button id="markAllReadBtn" class="linkBtn">Mark All Read</button>
+      </div>
+      <ul id="notifPanelList"></ul>
+    </div>
+
+    <!-- 2f. Incoming challenge modal -->
+    <div id="challengeModal" class="hidden">
+      <div id="challengeModalBox">
+        <div id="challengeModalKicker">⚔️ CHALLENGE</div>
+        <p id="challengeModalText"></p>
+        <div class="hint">60 SECOND PUSH-UP DUEL</div>
+        <div class="rematchRespondRow">
+          <button id="challengeAcceptBtn">✅ ACCEPT</button>
+          <button id="challengeDeclineBtn" class="secondary">❌ DECLINE</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2b. Profile -->
+    <section id="profileScreen" class="card cardWide hidden">
+      <div id="profileHeader">
+        <div id="profileAvatar">🙂</div>
+        <div id="profileNameBlock">
+          <div id="profileUsername">—</div>
+          <div id="profileCountry" class="hidden"></div>
+          <div id="profileRankBadge">—</div>
+        </div>
+        <button id="editProfileBtn" class="linkBtn">✏️ Edit</button>
+      </div>
+      <p id="profileBio" class="hint hidden"></p>
+
+      <div id="levelBlock">
+        <div id="levelLabelRow">
+          <span id="levelLabel">LEVEL 1</span>
+          <span id="xpLabel">0 / 100 XP</span>
+        </div>
+        <div id="xpBarTrack"><div id="xpBarFill"></div></div>
+      </div>
+
+      <!-- Edit form (hidden unless editing) -->
+      <div id="editProfileForm" class="hidden">
+        <label class="hint">Country (optional)</label>
+        <div id="countryPicker" class="countryPicker">
+          <input id="editCountryInput" type="text" autocomplete="off" placeholder="Search country...">
+          <input id="editCountryCode" type="hidden" value="">
+          <ul id="countryOptions" class="countryOptions hidden"></ul>
+        </div>
+        <label class="hint">Bio</label>
+        <input id="editBioInput" type="text" maxlength="140" placeholder="Tell us about yourself...">
+        <label class="hint">Choose an Avatar</label>
+        <div id="avatarPicker"></div>
+        <div class="rematchRespondRow">
+          <button id="saveProfileBtn">💾 Save</button>
+          <button id="cancelEditProfileBtn" class="secondary">Cancel</button>
+        </div>
+        <p id="editProfileError" class="error"></p>
+      </div>
+
+      <div id="profileStats">
+        <div class="statBox">
+          <div class="statLabel">Elo</div>
+          <div class="statValue" id="profileElo">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Peak Elo</div>
+          <div class="statValue" id="profilePeakElo">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Wins</div>
+          <div class="statValue" id="profileWins">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Losses</div>
+          <div class="statValue" id="profileLosses">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Draws</div>
+          <div class="statValue" id="profileDraws">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Win Rate %</div>
+          <div class="statValue" id="profileWinRate">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Personal Best</div>
+          <div class="statValue" id="profileBest">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Total Push-ups</div>
+          <div class="statValue" id="profileTotalPushups">—</div>
+        </div>
+      </div>
+
+      <h3>Achievements</h3>
+      <div id="achievementCategoryTabs">
+        <button class="achCatTab active" data-cat="all">All</button>
+        <button class="achCatTab" data-cat="beginner">Beginner</button>
+        <button class="achCatTab" data-cat="competitive">Competitive</button>
+        <button class="achCatTab" data-cat="performance">Performance</button>
+        <button class="achCatTab" data-cat="rpg">RPG</button>
+      </div>
+      <div id="achievementsGrid"></div>
+
+      <h3>Recent Matches</h3>
+      <ul id="matchHistoryList"></ul>
+    </section>
+
+    <!-- 3. Waiting for match -->
+    <section id="waitingScreen" class="card hidden">
+      <h2>Finding Opponent…</h2>
+      <div class="spinner"></div>
+      <p id="waitingHint">Waiting for another player to connect.</p>
+      <button id="cancelQueueBtn" class="secondary">Cancel</button>
+    </section>
+
+    <!-- 4. Matched / ready -->
+    <section id="readyScreen" class="card hidden">
+      <h2 id="readyTitle">Opponent Found!</h2>
+      <p><strong id="opponentName"></strong> (Elo <span id="opponentElo"></span>)</p>
+
+      <div id="readyStatusRow">
+        <div class="readyStatusBox">
+          <div class="readyStatusLabel">YOU</div>
+          <div id="myReadyStatus" class="readyStatusValue">⏳ Waiting</div>
+        </div>
+        <div class="readyStatusBox">
+          <div class="readyStatusLabel">OPPONENT</div>
+          <div id="oppReadyStatus" class="readyStatusValue">⏳ Waiting</div>
+        </div>
+      </div>
+
+      <!-- Auto-ready camera check: gets the player into position and marks
+           them ready automatically once conditions hold steady — no manual
+           button that risks knocking them out of position. -->
+      <div id="readyCameraCheck">
+        <div id="readyCameraWrap">
+          <video id="readyCameraVideo" autoplay playsinline muted></video>
+          <canvas id="readyCameraCanvas"></canvas>
+        </div>
+        <p id="readyCheckStatusText" class="hint">Starting camera…</p>
+      </div>
+
+      <!-- Manual fallback — only shown if the camera/AI model can't start
+           at all, so a player without camera access can still play. -->
+      <button id="startMatchBtn" class="hidden">✅ READY</button>
+    </section>
+
+    <!-- 5. Match in progress -->
+    <section id="matchScreen" class="card cardWide hidden">
+      <div id="countdownOverlay" class="hidden">
+        <div id="countdownNumber">3</div>
+      </div>
+
+      <div id="matchTopRow">
+        <div id="timer">60</div>
+        <button id="soundToggleBtn" class="linkBtn">🔊 Sound</button>
+      </div>
+
+      <div id="battleBar">
+        <div id="battleBarLabelsRow">
+          <span id="battleBarYouLabel">YOU <span id="battleBarYouCount">0</span></span>
+          <span id="battleBarOppLabel"><span id="battleBarOppCount">0</span> OPPONENT</span>
+        </div>
+        <div id="battleBarTrack">
+          <div id="battleBarYouFill"></div>
+          <div id="battleBarMarker">⚔</div>
+        </div>
+        <div id="battleBarStatus"></div>
+        <div id="battleBarCloseNote" class="hidden">⚔ CLOSE MATCH</div>
+      </div>
+
+      <div id="cameraWrap">
+        <video id="cameraVideo" autoplay playsinline muted></video>
+        <canvas id="cameraCanvas"></canvas>
+        <div id="cameraStatus">📷 Starting camera…</div>
+      </div>
+
+      <div id="pushupCount">0</div>
+
+      <p class="hint" id="detectionHint">
+        Stand sideways in front of the camera — the counter increases automatically.
+      </p>
+
+      <button id="manualAddBtn" class="secondary">➕ Add Rep Manually (if camera fails)</button>
+    </section>
+
+    <!-- 6. Waiting for opponent's result -->
+    <section id="pendingResultScreen" class="card hidden">
+      <h2>Done!</h2>
+      <p>Your count: <strong id="myFinalCount"></strong></p>
+      <p id="pendingHint">Waiting for your opponent to finish…</p>
+      <div class="spinner"></div>
+    </section>
+
+    <!-- 7. Result -->
+    <section id="resultScreen" class="card hidden">
+      <h2 id="resultTitle"></h2>
+      <p id="personalBestBadge" class="badge hidden">🔥 PERSONAL BEST!</p>
+      <p id="streakBadge" class="badge hidden"></p>
+      <div class="resultRow">
+        <div class="resultPlayer">
+          <div id="resultMeName"></div>
+          <div id="resultMeCount" class="bigNum"></div>
+          <div id="resultMeElo" class="eloChange"></div>
+        </div>
+        <div class="vs">VS</div>
+        <div class="resultPlayer">
+          <div id="resultOppName"></div>
+          <div id="resultOppCount" class="bigNum"></div>
+          <div id="resultOppElo" class="eloChange"></div>
+        </div>
+      </div>
+
+      <div id="resultXpBlock">
+        <p id="resultXpGained">+0 XP</p>
+        <div id="resultLevelRow">
+          <span id="resultLevelLabel">LEVEL 1</span>
+          <span id="resultXpLabel">0 / 100 XP</span>
+        </div>
+        <div id="resultXpBarTrack"><div id="resultXpBarFill"></div></div>
+        <p id="resultLevelUpBanner" class="badge hidden"></p>
+      </div>
+
+      <div id="rematchArea">
+        <button id="rematchBtn">🔁 REMATCH</button>
+        <p id="rematchStatus" class="hint hidden"></p>
+        <div id="rematchRespondBox" class="hidden">
+          <p id="rematchRequestText" class="hint"></p>
+          <div class="rematchRespondRow">
+            <button id="rematchAcceptBtn">✅ ACCEPT</button>
+            <button id="rematchDeclineBtn" class="secondary">❌ DECLINE</button>
+          </div>
+        </div>
+      </div>
+
+      <button id="playAgainBtn" class="secondary">🏠 HOME</button>
+    </section>
+
+  </main>
+
+  <script type="module" src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
