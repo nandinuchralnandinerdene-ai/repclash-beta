@@ -521,7 +521,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_user_ach_user ON user_achievements(user_id);
         CREATE INDEX IF NOT EXISTS idx_matches_status ON matches(status);
         CREATE INDEX IF NOT EXISTS idx_users_elo ON users(elo);
-        CREATE INDEX IF NOT EXISTS idx_users_country_elo ON users(country, elo);
         """
     )
 
@@ -542,6 +541,11 @@ def init_db():
         db.execute("UPDATE users SET longest_streak = current_streak WHERE longest_streak < current_streak")
     if "country" not in user_cols_v13:
         db.execute("ALTER TABLE users ADD COLUMN country TEXT")
+    # Must run AFTER the ALTER TABLE above, not in the earlier executescript
+    # block — on a brand-new database (no pre-existing users.country column)
+    # that block runs before this column exists, and creating an index on a
+    # nonexistent column fails immediately: "no such column: country".
+    db.execute("CREATE INDEX IF NOT EXISTS idx_users_country_elo ON users(country, elo)")
     if "bio" not in user_cols_v13:
         db.execute("ALTER TABLE users ADD COLUMN bio TEXT")
     if "avatar_id" not in user_cols_v13:
