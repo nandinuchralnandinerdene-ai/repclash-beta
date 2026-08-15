@@ -2,3 +2,4 @@ pushup_elo.db
 __pycache__/
 *.pyc
 .env
+profile_pictures/

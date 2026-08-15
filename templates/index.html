@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>REPCLASH</title>
+<title>VISOREP</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
 
   <header>
     <div id="brandBlock">
-      <h1>💪 REPCLASH</h1>
+      <h1>💪 VISOREP</h1>
       <span id="brandTagline">Your reps. Their reps. One winner.</span>
     </div>
     <div id="userBadge" class="hidden">
@@ -53,14 +53,40 @@
         <input id="loginPasswordInput" type="password" placeholder="Password">
         <button id="loginBtn">Log In</button>
         <p id="loginError" class="error"></p>
+        <button id="forgotPasswordLinkBtn" type="button" class="linkBtn">Forgot password?</button>
+        <button id="googleLoginBtn" type="button" class="googleAuthBtn hidden">
+          <span class="googleAuthIcon" aria-hidden="true">G</span> Continue with Google
+        </button>
       </div>
 
       <div id="signupForm" class="hidden">
         <h2>Sign Up</h2>
         <input id="signupUsernameInput" type="text" placeholder="Username" maxlength="20">
+        <input id="signupEmailInput" type="email" placeholder="Email (optional — enables password recovery)">
         <input id="signupPasswordInput" type="password" placeholder="Password (6+ characters)">
         <button id="signupBtn">Sign Up</button>
         <p id="signupError" class="error"></p>
+        <button id="googleSignupBtn" type="button" class="googleAuthBtn hidden">
+          <span class="googleAuthIcon" aria-hidden="true">G</span> Continue with Google
+        </button>
+      </div>
+
+      <div id="forgotPasswordForm" class="hidden">
+        <h2>Reset Password</h2>
+        <p class="hint">Enter your account email and we'll send a reset link if it matches an account.</p>
+        <input id="forgotPasswordEmailInput" type="email" placeholder="Email">
+        <button id="forgotPasswordSubmitBtn">Send Reset Link</button>
+        <button id="forgotPasswordBackBtn" type="button" class="linkBtn">Back to Log In</button>
+        <p id="forgotPasswordMsg" class="hint"></p>
+        <p id="forgotPasswordError" class="error"></p>
+      </div>
+
+      <div id="resetPasswordForm" class="hidden">
+        <h2>Set a New Password</h2>
+        <input id="resetPasswordInput" type="password" placeholder="New password (6+ characters)">
+        <button id="resetPasswordSubmitBtn">Reset Password</button>
+        <p id="resetPasswordMsg" class="hint"></p>
+        <p id="resetPasswordError" class="error"></p>
       </div>
     </section>
 
@@ -90,7 +116,7 @@
       <!-- Optional — only shown when the user has a genuinely unfinished RPG
            encounter. Purely informational; never auto-opens the battle. -->
       <div id="homeRpgContinueCard" class="monsterCard hidden">
-        <div class="homeRpgContinueLabel hint">RPG · Unfinished Battle</div>
+        <div class="homeRpgContinueLabel hint">⚔ RPG · UNFINISHED BATTLE</div>
         <div class="homeRpgContinueRow">
           <div class="monsterCardIcon" id="homeRpgContinueIcon">👺</div>
           <div>
@@ -116,10 +142,49 @@
       </div>
     </section>
 
-    <!-- 2g. RPG Home -->
-    <section id="rpgHomeScreen" class="card cardWide hidden">
-      <h2>RPG</h2>
+    <!-- 2g0. RPG World Map — the five realms -->
+    <section id="rpgWorldScreen" class="card cardWide hidden rpg-themed">
+      <h2>THE FIVE REALMS</h2>
+      <p class="hint">Train your body. Reclaim your power.</p>
+
+      <div id="rpgWorldMapBanner">
+        <img src="/static/rpg/world/five_realms_world_map.jpg" alt="The Five Realms world map" loading="lazy" onerror="this.parentElement.classList.add('hidden')">
+        <div id="rpgWorldMapHotspots"></div>
+      </div>
+
+      <div id="rpgCharacterStrip">
+        <div id="rpgCharacterPortrait"></div>
+        <div id="rpgCharacterSilhouette">
+          <span id="rpgCharacterEmoji"></span>
+        </div>
+        <div id="rpgCharacterSummary">
+          <div id="rpgCharacterFragments">0 / 5 Fragments Reclaimed</div>
+          <div class="hint" id="rpgCharacterLevelLine">Level 1 · Novice</div>
+        </div>
+        <div id="rpgCharacterBadge" class="rpgBadgeSlot"></div>
+      </div>
+
+      <p id="rpgMapLegend" class="hint">✓ Reclaimed &nbsp;·&nbsp; → Current &nbsp;·&nbsp; 🔒 Locked &nbsp;·&nbsp; Tap a realm on the map to enter</p>
+    </section>
+
+    <!-- 2g. RPG Home (Emberfall detail — the only playable realm in V1) -->
+    <section id="rpgHomeScreen" class="card cardWide hidden rpg-themed">
+      <button id="rpgBackToWorldBtn" class="linkBtn">🗺️ World Map</button>
+      <h2 id="rpgHomeRealmTitleRow"><span id="rpgHomeRealmEmblem" class="rpgInlineEmblem"></span><span id="rpgHomeRealmTitle">EMBERFALL</span></h2>
+      <p class="hint" id="rpgHomeRealmSubtitle">The Land of Ash &amp; Flame</p>
+      <p id="rpgHomeRealmFlavor" class="hint"></p>
+
+      <div id="rpgJourneyMapBanner"><img src="/static/rpg/world/emberfall_journey_map.jpg" alt="Emberfall journey map" loading="lazy" onerror="this.parentElement.classList.add('hidden')"></div>
+
+      <div id="rpgRealmProgressRow">
+        <span id="rpgRealmProgressPct">0% Reclaimed</span>
+      </div>
+      <div id="rpgRealmProgressTrack"><div id="rpgRealmProgressFill"></div></div>
+      <p class="hint" id="rpgRealmProgressReps">0 / 10,000 reps reclaimed</p>
+
       <div id="rpgPlayerHeader">
+        <div id="rpgHomeCharacterPortrait"></div>
+        <div id="rpgHeaderBadge" class="rpgBadgeSlot"></div>
         <div class="rpgStatBox">
           <div class="statLabel">RPG LEVEL</div>
           <div class="statValue" id="rpgLevelValue">1</div>
@@ -137,15 +202,74 @@
       <div id="rpgXpBarTrack"><div id="rpgXpBarFill"></div></div>
       <p class="hint" id="rpgXpLabel">0 / 200 XP</p>
 
+      <div id="rpgCurrentArmorBox">
+        <div id="rpgCurrentArmorArt"></div>
+        <div>
+          <div class="hint">CURRENT CHEST ARMOR</div>
+          <div id="rpgCurrentArmorName">Worn Emberplate</div>
+          <div class="hint">CURRENT SHIELD</div>
+          <div id="rpgCurrentShieldName">Base Shield</div>
+        </div>
+      </div>
+
+      <button id="shieldLadderToggleBtn" type="button" class="linkBtn">🔰 Shield Progression</button>
+      <div id="shieldLadderWrap" class="hidden"></div>
+
       <div id="rpgContinueBattleBox" class="monsterCard hidden"></div>
 
-      <h3>Monsters</h3>
-      <div id="monsterGrid"></div>
+      <h3>Your Journey</h3>
+      <div id="rpgLocalMap"></div>
     </section>
 
+    <!-- 2g3. Armor upgrade modal — shown after the current battle/result,
+         never mid-camera-exercise -->
+    <div id="armorUpgradeModal" class="hidden">
+      <div id="armorUpgradeModalBox">
+        <div id="armorUpgradeKicker">NEW EQUIPMENT</div>
+        <div id="armorUpgradeCharacterWrap"></div>
+        <div id="armorUpgradeArt"></div>
+        <h2 id="armorUpgradeName">Ashwood Chestplate</h2>
+        <p id="armorUpgradeShieldName" class="hint"></p>
+        <p id="armorUpgradeReps" class="hint">1,000 reps reclaimed</p>
+        <button id="armorUpgradeCloseBtn">Continue</button>
+      </div>
+    </div>
+
+    <!-- 2g1. Locked realm modal -->
+    <div id="realmLockedModal" class="hidden">
+      <div id="realmLockedModalBox">
+        <div id="realmLockedEmblem" class="rpgLockedEmblemSlot"></div>
+        <div id="realmLockedIcon">🔒</div>
+        <h2 id="realmLockedName">Thornveil</h2>
+        <p class="hint" id="realmLockedExercise">LUNGES</p>
+        <p id="realmLockedText">This realm has not yet awakened.</p>
+        <p class="hint">Coming soon</p>
+        <button id="realmLockedCloseBtn">Back to the Map</button>
+      </div>
+    </div>
+
+    <!-- 2g2. Realm completion modal — the marketing-worthy moment -->
+    <div id="realmCompleteModal" class="hidden">
+      <div id="realmCompleteModalBox">
+        <div id="realmCompleteKicker">REALM RECLAIMED</div>
+        <h2 id="realmCompleteName">EMBERFALL DEFEATED</h2>
+        <div id="realmCompleteCheck">✓</div>
+        <p class="hint">You reclaimed the first fragment of your power.</p>
+        <div id="realmCompleteReward">
+          <div id="realmCompleteRewardIcon"></div>
+          <div id="realmCompleteRewardName">CHEST ARMOR ACQUIRED</div>
+        </div>
+        <p id="realmCompleteCounter">REALMS: 1 / 5</p>
+        <button id="realmCompleteCloseBtn">Continue</button>
+      </div>
+    </div>
+
     <!-- 2h. RPG Battle (TIMELESS — no countdown, no timer; runs until victory or Leave Battle) -->
-    <section id="rpgBattleScreen" class="card cardWide hidden">
+    <section id="rpgBattleScreen" class="card cardWide hidden rpg-themed">
+      <div id="rpgBattleArenaOverlay"></div>
+      <div id="rpgBattleIntroFlash" class="hidden"></div>
       <div id="battleMonsterHeader">
+        <span id="battleBossLabel" class="hidden">⚠️ BOSS</span>
         <span id="battleMonsterIcon">👺</span>
         <span id="battleMonsterName">Monster</span>
         <span id="rpgDamagePopup"></span>
@@ -164,6 +288,7 @@
         <video id="rpgCameraVideo" autoplay playsinline muted></video>
         <canvas id="rpgCameraCanvas"></canvas>
         <div id="rpgCameraStatus">📷 Starting camera…</div>
+        <div id="rpgCameraActiveIndicator" class="cameraActiveIndicator hidden"><span class="cameraActiveDot"></span>CAMERA ACTIVE</div>
       </div>
 
       <div id="rpgRepCount">0</div>
@@ -176,6 +301,7 @@
     <section id="cameraSetupScreen" class="card hidden">
       <h2>📷 Camera Setup</h2>
       <p class="hint">Let's make sure your camera can track your push-ups correctly.</p>
+      <p class="cameraPrivacyNote">Camera access is used only to analyze your movement. Your camera feed is not shared publicly, and nothing is uploaded — rep counting happens on your own device.</p>
 
       <ul id="cameraSetupChecklist">
         <li>Stand <strong>sideways</strong> to the camera</li>
@@ -189,6 +315,7 @@
         <video id="setupCameraVideo" autoplay playsinline muted></video>
         <canvas id="setupCameraCanvas"></canvas>
         <div id="setupCameraStatus">📷 Starting camera…</div>
+        <div id="setupCameraActiveIndicator" class="cameraActiveIndicator hidden"><span class="cameraActiveDot"></span>CAMERA ACTIVE</div>
       </div>
 
       <div id="setupLiveChecks">
@@ -201,7 +328,7 @@
     </section>
 
     <!-- 2i. RPG Result -->
-    <section id="rpgResultScreen" class="card hidden">
+    <section id="rpgResultScreen" class="card hidden rpg-themed">
       <h2 id="rpgResultTitle">VICTORY!</h2>
       <p id="rpgResultSubtitle" class="hint"></p>
       <div id="rpgResultRewards" class="hidden">
@@ -254,13 +381,42 @@
           <div id="publicProfileUsername">—</div>
           <div id="publicProfileCountry" class="hidden"></div>
           <div id="publicProfileRankBadge">—</div>
+          <div id="publicProfileJoinDate" class="hint hidden"></div>
         </div>
       </div>
       <p id="publicProfileBio" class="hint hidden"></p>
+
+      <p id="publicProfileRestrictedNote" class="hint hidden">🔒 This player's full profile is friends-only.</p>
+
+      <div id="publicProfileRpgSection" class="rpg-themed hidden">
+        <h3>CHARACTER</h3>
+        <div id="publicProfileCharacterBlock">
+          <div id="publicProfileCharacterPortrait"></div>
+          <div id="publicProfileLevelLine">
+            <div id="publicProfileRpgBadge" class="rpgBadgeSlot"></div>
+            <span id="publicProfileRpgLevelText">LEVEL 1 · NOVICE</span>
+          </div>
+        </div>
+        <p class="hint" id="publicProfileEmberfallReps">0 / 10,000 reps reclaimed</p>
+        <div id="publicProfileEquipmentRow">
+          <span id="publicProfileChestLabel" class="equipmentChip"></span>
+          <span id="publicProfileShieldLabel" class="equipmentChip"></span>
+        </div>
+        <div id="publicProfileRealmsLine" class="hint"></div>
+      </div>
+
       <div id="publicProfileStats">
         <div class="statBox">
           <div class="statLabel">Elo</div>
           <div class="statValue" id="publicProfileElo">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Peak Elo</div>
+          <div class="statValue" id="publicProfilePeakElo">—</div>
+        </div>
+        <div class="statBox">
+          <div class="statLabel">Win Rate</div>
+          <div class="statValue" id="publicProfileWinRate">—</div>
         </div>
         <div class="statBox">
           <div class="statLabel">Wins</div>
@@ -271,10 +427,20 @@
           <div class="statValue" id="publicProfileLosses">—</div>
         </div>
         <div class="statBox">
+          <div class="statLabel">Total Matches</div>
+          <div class="statValue" id="publicProfileTotalMatches">—</div>
+        </div>
+        <div class="statBox">
           <div class="statLabel">Personal Best</div>
           <div class="statValue" id="publicProfileBest">—</div>
         </div>
+        <div class="statBox">
+          <div class="statLabel">Total Push-ups</div>
+          <div class="statValue" id="publicProfileTotalPushups">—</div>
+        </div>
       </div>
+
+      <h3 id="publicProfileAchTitle">Achievements</h3>
       <div id="publicProfileAchievements"></div>
       <div id="publicProfileActionArea"></div>
     </section>
@@ -286,6 +452,99 @@
         <button id="markAllReadBtn" class="linkBtn">Mark All Read</button>
       </div>
       <ul id="notifPanelList"></ul>
+    </div>
+
+    <!-- 2g. "How It Works" / AI camera onboarding modal — shown once per
+         browser (see visorep_ai_intro_seen in app.js), reopenable via
+         "How it works?" -->
+    <div id="aiIntroModal" class="hidden">
+      <div id="aiIntroModalBox">
+        <h2 id="aiIntroTitle">HOW IT WORKS</h2>
+        <p class="hint">Set up your camera correctly, perform your push-ups, and VISOREP will count your valid reps.</p>
+
+        <div id="howItWorksInfographicWrap">
+          <img id="howItWorksInfographic" src="/static/onboarding/how_it_works.jpg"
+               alt="How it works: camera setup examples, the 3-step push-up rep cycle, and important tips for accurate counting"
+               loading="lazy">
+          <a id="howItWorksFullSizeLink" href="/static/onboarding/how_it_works.jpg" target="_blank" rel="noopener">🔍 View full size</a>
+        </div>
+
+        <div id="howItWorksSteps">
+          <div class="howItWorksStep">
+            <div class="howItWorksStepNum">1</div>
+            <div>
+              <div class="howItWorksStepTitle">GET IN FRAME</div>
+              <div class="hint">Keep your entire body visible from head to feet.</div>
+            </div>
+          </div>
+          <div class="howItWorksStep">
+            <div class="howItWorksStepNum">2</div>
+            <div>
+              <div class="howItWorksStepTitle">GO DOWN</div>
+              <div class="hint">Lower your body naturally.</div>
+            </div>
+          </div>
+          <div class="howItWorksStep">
+            <div class="howItWorksStepNum">3</div>
+            <div>
+              <div class="howItWorksStepTitle">COME BACK UP</div>
+              <div class="hint">Return to the starting position. A valid cycle counts as 1 rep.</div>
+            </div>
+          </div>
+        </div>
+
+        <p class="hint" id="howItWorksCameraTips">
+          Keep the phone stable · Use a side or 3-quarter angle · Keep your shoulder, elbow, and wrist visible ·
+          Good lighting · Full body inside the frame
+        </p>
+        <p class="hint" id="howItWorksNote">If VISOREP cannot clearly see your body or movement, the rep may not count.</p>
+
+        <p class="cameraPrivacyNote">Camera access is used only to analyze your movement. Your camera feed is not shared publicly, and nothing is uploaded — rep counting happens on your own device.</p>
+        <button id="aiIntroContinueBtn">Got it — Continue</button>
+      </div>
+    </div>
+
+    <!-- 2g2. RPG-specific "How It Works" — same visual language as the PvP
+         modal above (same infographic, same 3-step cycle, same tips), plus
+         an RPG-only game-loop section. Separate persistent flag
+         (has_seen_rpg_how_it_works) — a player can have seen one without
+         the other. -->
+    <div id="rpgIntroModal" class="hidden">
+      <div id="rpgIntroModalBox" class="rpg-themed">
+        <h2 id="rpgIntroTitle">HOW RPG WORKS</h2>
+        <p class="hint">Your real push-ups power your character. Same camera, same valid-rep detection — now it drives your journey through Emberfall.</p>
+
+        <div id="rpgIntroInfographicWrap">
+          <img src="/static/onboarding/how_it_works.jpg"
+               alt="How it works: camera setup examples and the 3-step push-up rep cycle"
+               loading="lazy">
+          <a href="/static/onboarding/how_it_works.jpg" target="_blank" rel="noopener">🔍 View full size</a>
+        </div>
+
+        <p class="hint" id="rpgIntroCameraTips">
+          Full body in frame · Side or 3-quarter angle · Shoulder, elbow, and wrist visible ·
+          Good lighting · Avoid extreme hip sag or pike
+        </p>
+
+        <h3 id="rpgIntroLoopTitle">THE RPG LOOP</h3>
+        <div id="rpgIntroLoop">
+          <div class="rpgIntroLoopStep">💪 DO PUSH-UPS</div>
+          <div class="rpgIntroLoopArrow">↓</div>
+          <div class="rpgIntroLoopStep">⭐ EARN XP + GOLD</div>
+          <div class="rpgIntroLoopArrow">↓</div>
+          <div class="rpgIntroLoopStep">⚔️ DEFEAT ENEMIES</div>
+          <div class="rpgIntroLoopArrow">↓</div>
+          <div class="rpgIntroLoopStep">🗺️ PROGRESS THROUGH REALMS</div>
+          <div class="rpgIntroLoopArrow">↓</div>
+          <div class="rpgIntroLoopStep">🛡️ UNLOCK ARMOR + SHIELDS</div>
+          <div class="rpgIntroLoopArrow">↓</div>
+          <div class="rpgIntroLoopStep">🔥 FIGHT THE ASHEN GUARDIAN</div>
+          <div class="rpgIntroLoopArrow">↓</div>
+          <div class="rpgIntroLoopStep rpgIntroLoopFinal">👑 REACH LEGENDARY</div>
+        </div>
+
+        <button id="rpgIntroContinueBtn">Got it — Continue</button>
+      </div>
     </div>
 
     <!-- 2f. Incoming challenge modal -->
@@ -304,7 +563,10 @@
     <!-- 2b. Profile -->
     <section id="profileScreen" class="card cardWide hidden">
       <div id="profileHeader">
-        <div id="profileAvatar">🙂</div>
+        <div id="profileAvatar">
+          <img id="profileAvatarImg" class="hidden" alt="">
+          <span id="profileAvatarEmoji">🙂</span>
+        </div>
         <div id="profileNameBlock">
           <div id="profileUsername">—</div>
           <div id="profileCountry" class="hidden"></div>
@@ -334,6 +596,26 @@
         <input id="editBioInput" type="text" maxlength="140" placeholder="Tell us about yourself...">
         <label class="hint">Choose an Avatar</label>
         <div id="avatarPicker"></div>
+
+        <label class="hint">Choose a profile picture</label>
+        <div id="profilePicturePreviewRow">
+          <img id="profilePicturePreviewImg" class="hidden" alt="Profile picture preview">
+          <span id="profilePictureEmptyLabel" class="hint">No profile picture set</span>
+        </div>
+        <input id="profilePictureFileInput" type="file" accept="image/jpeg,image/png,image/webp">
+        <p class="hint" id="profilePictureFormatHint">JPG, PNG or WebP — any normal photo works, we'll resize it automatically.</p>
+        <button id="removeProfilePictureBtn" type="button" class="secondary hidden">Remove Picture</button>
+        <p id="profilePictureError" class="error"></p>
+
+        <label class="hint">Email (optional — enables password recovery / Google sign-in linking)</label>
+        <input id="editEmailInput" type="email" placeholder="you@example.com">
+
+        <label class="hint">Profile Visibility</label>
+        <select id="editProfileVisibilitySelect">
+          <option value="public">Public — anyone can view</option>
+          <option value="friends">Friends only</option>
+        </select>
+
         <div class="rematchRespondRow">
           <button id="saveProfileBtn">💾 Save</button>
           <button id="cancelEditProfileBtn" class="secondary">Cancel</button>
@@ -376,6 +658,31 @@
         </div>
       </div>
 
+      <div id="profileRpgSection" class="hidden rpg-themed">
+        <h3>YOUR RPG CHARACTER</h3>
+        <div id="profileRpgCharacterBlock">
+          <div id="profileRpgCharacterPortrait"></div>
+          <div id="profileRpgLevelLine">
+            <div id="profileRpgBadge" class="rpgBadgeSlot"></div>
+            <span id="profileRpgLevelRankText">LEVEL 1 · NOVICE</span>
+          </div>
+        </div>
+        <div id="profileRpgSummary">
+          <div class="rpgStatBox">
+            <div class="statLabel">RPG LEVEL</div>
+            <div class="statValue" id="profileRpgLevel">1</div>
+            <div class="hint" id="profileRpgRank">Novice</div>
+          </div>
+          <div class="rpgStatBox">
+            <div class="statLabel">REALMS RECLAIMED</div>
+            <div class="statValue" id="profileRpgRealms">0 / 5</div>
+          </div>
+        </div>
+        <p class="hint" id="profileRpgEmberfallReps">0 / 10,000 reps reclaimed</p>
+        <p class="hint" id="profileRpgShieldLine">🔰 Base Shield</p>
+        <div id="profileRpgEquipment"></div>
+      </div>
+
       <h3>Achievements</h3>
       <div id="achievementCategoryTabs">
         <button class="achCatTab active" data-cat="all">All</button>
@@ -401,6 +708,27 @@
     <!-- 4. Matched / ready -->
     <section id="readyScreen" class="card hidden">
       <h2 id="readyTitle">Opponent Found!</h2>
+
+      <!-- Player intro / "VS" row — avatars only, no extra screen/delay -->
+      <div id="matchIntroRow">
+        <div class="matchIntroSide">
+          <div class="matchIntroAvatarWrap">
+            <img id="matchIntroMeImg" class="matchIntroAvatarImg hidden" alt="">
+            <span id="matchIntroMeEmoji" class="matchIntroAvatarEmoji"></span>
+          </div>
+          <div id="matchIntroMeName" class="matchIntroName">You</div>
+          <div id="matchIntroMeRank" class="matchIntroRank hint"></div>
+        </div>
+        <div class="matchIntroVs">VS</div>
+        <div class="matchIntroSide">
+          <div class="matchIntroAvatarWrap">
+            <img id="matchIntroOppImg" class="matchIntroAvatarImg hidden" alt="">
+            <span id="matchIntroOppEmoji" class="matchIntroAvatarEmoji"></span>
+          </div>
+          <div id="matchIntroOppName" class="matchIntroName">Opponent</div>
+        </div>
+      </div>
+
       <p><strong id="opponentName"></strong> (Elo <span id="opponentElo"></span>)</p>
 
       <div id="readyStatusRow">
@@ -418,9 +746,13 @@
            them ready automatically once conditions hold steady — no manual
            button that risks knocking them out of position. -->
       <div id="readyCameraCheck">
+        <h3 id="getIntoPositionTitle">GET INTO POSITION</h3>
+        <p class="hint" id="getIntoPositionInstructions">Place your hands under your shoulders, keep your body straight, and make sure your full body is visible.</p>
+        <button id="howItWorksLinkBtn" type="button" class="linkBtn">How it works?</button>
         <div id="readyCameraWrap">
           <video id="readyCameraVideo" autoplay playsinline muted></video>
           <canvas id="readyCameraCanvas"></canvas>
+          <div id="readyCameraActiveIndicator" class="cameraActiveIndicator hidden"><span class="cameraActiveDot"></span>CAMERA ACTIVE</div>
         </div>
         <p id="readyCheckStatusText" class="hint">Starting camera…</p>
       </div>
@@ -434,6 +766,7 @@
     <section id="matchScreen" class="card cardWide hidden">
       <div id="countdownOverlay" class="hidden">
         <div id="countdownNumber">3</div>
+        <div id="countdownHint">Wait for GO — reps only count after this</div>
       </div>
 
       <div id="matchTopRow">
@@ -442,6 +775,20 @@
       </div>
 
       <div id="battleBar">
+        <div id="battleBarAvatarsRow">
+          <div class="battleBarAvatarSide">
+            <div class="battleBarAvatarWrap">
+              <img id="battleBarMeImg" class="battleBarAvatarImg hidden" alt="">
+              <span id="battleBarMeEmoji" class="battleBarAvatarEmoji"></span>
+            </div>
+          </div>
+          <div class="battleBarAvatarSide">
+            <div class="battleBarAvatarWrap">
+              <img id="battleBarOppImg" class="battleBarAvatarImg hidden" alt="">
+              <span id="battleBarOppEmoji" class="battleBarAvatarEmoji"></span>
+            </div>
+          </div>
+        </div>
         <div id="battleBarLabelsRow">
           <span id="battleBarYouLabel">YOU <span id="battleBarYouCount">0</span></span>
           <span id="battleBarOppLabel"><span id="battleBarOppCount">0</span> OPPONENT</span>
@@ -458,6 +805,7 @@
         <video id="cameraVideo" autoplay playsinline muted></video>
         <canvas id="cameraCanvas"></canvas>
         <div id="cameraStatus">📷 Starting camera…</div>
+        <div id="cameraActiveIndicator" class="cameraActiveIndicator hidden"><span class="cameraActiveDot"></span>CAMERA ACTIVE</div>
       </div>
 
       <div id="pushupCount">0</div>

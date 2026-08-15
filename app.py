@@ -23,7 +23,8 @@ import random
 import time
 from datetime import datetime, timezone
 from functools import wraps
-from flask import Flask, g, jsonify, render_template, request, session
+from flask import Flask, g, jsonify, redirect, render_template, request, session
+import requests
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -35,7 +36,7 @@ except ImportError:
     LIMITER_AVAILABLE = False
 
 DB_PATH = "pushup_elo.db"
-STARTING_ELO = 1200
+STARTING_ELO = 1000  # V1.10: new players now start at Silver (was 1200/"Gold" under the old table)
 K_FACTOR = 32
 MATCH_DURATION_SECONDS = 60
 
@@ -129,6 +130,45 @@ ACTIVITY_RANK_REACHED = "RANK_REACHED"
 # feed with an event after every single win.
 WIN_STREAK_MILESTONES = {3, 5, 10, 15, 20}
 
+# --- V1.6: auth (Google OAuth, password reset), profile picture, privacy ---
+PASSWORD_RESET_TOKEN_TTL_SECONDS = 30 * 60   # 30 minutes, then the link is dead
+GOOGLE_OAUTH_STATE_SESSION_KEY = "google_oauth_state"
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI")  # e.g. https://visorep.onrender.com/api/auth/google/callback
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_OAUTH_CONFIGURED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
+
+# --- V1.11: RPG QA mode — dev/test-only Emberfall progress override -----
+# Gated entirely on an environment variable that must be explicitly set to
+# "true"; absent/false in any real deployment means the endpoint below
+# returns 404 as if it doesn't exist, and does nothing else differently.
+# Never weakens normal /hit validation — this is a SEPARATE route, not a
+# bypass wired into the real progression path.
+RPG_QA_MODE = os.environ.get("RPG_QA_MODE", "").strip().lower() == "true"
+
+# Profile picture upload limits.
+PROFILE_PICTURE_MAX_BYTES = 5 * 1024 * 1024       # 5 MB upload cap
+PROFILE_PICTURE_MAX_DECODE_DIMENSION = 8000        # DoS/decompression-bomb guard, not a user-facing limit
+PROFILE_PICTURE_OUTPUT_SIZE = 512                  # server re-encodes to a fixed square thumbnail
+PROFILE_PICTURE_DIR = os.environ.get("PROFILE_PICTURE_DIR", "profile_pictures")
+VALID_PROFILE_VISIBILITY = {"public", "friends"}
+VALID_MATCH_HISTORY_VISIBILITY = {"public", "friends", "private"}
+
+# Email delivery is intentionally pluggable: with no SMTP/provider env vars
+# configured (e.g. running locally, or before this is set up in Render), we
+# never silently pretend an email was sent — send_email() below logs the
+# message server-side and returns False so callers can react honestly
+# instead of the user just seeing "email sent" for an email that never left.
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+SMTP_FROM_ADDRESS = os.environ.get("SMTP_FROM_ADDRESS", "no-reply@visorep.app")
+EMAIL_CONFIGURED = bool(SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD)
+APP_PUBLIC_URL = os.environ.get("APP_PUBLIC_URL", "http://localhost:5000")
+
 # --- V1.5: RPG constants ---
 # IMPORTANT: RPG progression is a COMPLETELY SEPARATE track from both Elo
 # (competitive skill) and the existing V1.3 account XP/level (kept as-is
@@ -168,6 +208,147 @@ RPG_MONSTER_DEFS = [
     ("Orc", "Brutish and heavily armored.", 80, 4, 40, 18, "👹"),
     ("Demon", "A fearsome foe from the depths.", 130, 5, 60, 28, "😈"),
     ("Dragon", "Legendary. Only the strong prevail.", 220, 6, 100, 50, "🐉"),
+]
+
+# --- V1.7: RPG World / Five Realms ------------------------------------
+# ONLY Emberfall is playable — the other four have no exercise detection
+# built yet (see submit_hit: damage is hard-coded from push-up reps).
+# `playable` is a fixed fact about what we've built, not something a
+# player can ever unlock — deliberately so; see the V1.7 migration comment.
+REALM_DEFS = [
+    # code,        display_name,  subtitle,                      exercise_type,     flavor_text,                                             order, playable, slot,        reward_name
+    ("emberfall",  "Emberfall",   "The Land of Ash & Flame",     "push_up",         "A kingdom swallowed by ash. Only strength can restore its flame.", 1, 1, "chest",     "Chest Armor"),
+    ("thornveil",  "Thornveil",   "The Land of Thorns",          "lunge",           "An ancient thorned forest that tests agility.",         2, 0, "legs",      "Leg Armor"),
+    ("stoneheart", "Stoneheart",  "The Ancient Stone",           "plank",           "Silent ruins built on unshakable endurance.",           3, 0, "core",      "Core Armor"),
+    ("ironreach",  "Ironreach",   "The Iron Fortress",           "squat",           "A fortress of raw, grounded power.",                    4, 0, "power",     "Power Armor"),
+    ("stormspire", "Stormspire",  "The Land Above the Clouds",   "shoulder_press",  "A mountain spire wreathed in lightning.",               5, 0, "shoulders", "Shoulder Armor"),
+]
+
+# --- V1.8: Emberfall long-form progression (10,000 valid push-up reps) ---
+# Each tuple: (min_reps_inclusive, max_reps_inclusive, location_name,
+# monster_theme_name). Ranges are progression milestones, NOT "one
+# encounter per monster" — the player fights through many encounters (any
+# monster, any order, same as before) and EVERY accepted hit's reps (the
+# same server-validated number already used for combat damage — nothing
+# new or separately trusted) accumulate into this cumulative counter.
+# Boundaries are inclusive on both ends per spec.
+#
+# NOTE (V1.12 correction): this table used to also carry armor_name, tied
+# 1:1 to these same 6 location brackets. That's now WRONG — chest armor
+# has its own 7-tier boundary table (CHEST_ARMOR_TIERS below), matching
+# shield's boundaries exactly, decoupled from location. Location/monster
+# assignment is UNCHANGED by this correction — only what armor is shown
+# at each rep count changed.
+EMBERFALL_MILESTONES = [
+    (0, 999, "Ashen Gate", "Ember Slime"),
+    (1000, 2499, "Cinder Road", "Ash Goblin"),
+    (2500, 4499, "Ember Ruins", "Cinder Skeleton"),
+    (4500, 6499, "Fallen Shrine", "Flame Orc"),
+    (6500, 8499, "Iron Bastion", "Ash Demon"),
+    (8500, 10000, "Ashen Guardian", "The Ashen Guardian"),
+]
+EMBERFALL_TOTAL_REPS = 10000
+EMBERFALL_BOSS_UNLOCK_REPS = 8500  # matches the final milestone's lower bound
+
+
+def emberfall_milestone_for(progress_value):
+    """Returns the LOCATION/monster milestone whose range contains
+    progress_value — clamped so anything beyond 10,000 still resolves to
+    the final tier rather than falling through to no match. Does NOT
+    determine chest armor (see get_chest_armor_tier) — location and armor
+    are independent axes that happen to share some (not all) boundaries."""
+    clamped = min(max(progress_value, 0), EMBERFALL_TOTAL_REPS)
+    for lo, hi, location, monster_theme in EMBERFALL_MILESTONES:
+        if lo <= clamped <= hi:
+            return {"min": lo, "max": hi, "location_name": location, "monster_theme": monster_theme}
+    return None  # unreachable given the clamp, but keep it explicit
+
+
+# --- V1.12 CORRECTION: chest armor is its OWN 7-tier ladder, matching
+# shield's boundaries exactly (0-999 has NO armor at all — "Worn
+# Emberplate" now starts at 1000, not 0, which was the bug this table
+# fixes). Deliberately the SAME shape as SHIELD_TIERS (same 7 boundaries)
+# so armor and shield always change together, at the same instant, from
+# now on — the "Legendary armor but not-yet-Legendary shield" 8500-9999
+# mismatch that existed under the OLD 6-tier armor table cannot happen
+# with this table, by construction.
+CHEST_ARMOR_TIERS = [
+    (0, 999, None, "No Chest Armor"),
+    (1000, 2499, "WORN_EMBERPLATE", "Worn Emberplate"),
+    (2500, 4499, "ASHWOOD_CHESTPLATE", "Ashwood Chestplate"),
+    (4500, 6499, "CINDER_IRONPLATE", "Cinder Ironplate"),
+    (6500, 8499, "EMBERGOLD_CHESTPLATE", "Embergold Chestplate"),
+    (8500, 9999, "OBSIDIAN_FLAMEPLATE", "Obsidian Flameplate"),
+    (10000, None, "LEGENDARY_EMBERPLATE", "Legendary Emberplate"),
+]
+
+
+def get_chest_armor_tier(emberfall_reps):
+    """Pure function, single source of truth for chest-armor progression.
+    Mirrors get_shield_tier()'s shape/boundaries exactly. Returns a dict
+    with code/name/range; name is "No Chest Armor" (code=None) for
+    0-999 reps — the character has genuinely no chest armor equipped at
+    that stage, not a placeholder item."""
+    reps = max(0, emberfall_reps)
+    for lo, hi, code, name in CHEST_ARMOR_TIERS:
+        if hi is None:
+            if reps >= lo:
+                return {"code": code, "name": name, "min": lo, "max": hi}
+        elif lo <= reps <= hi:
+            return {"code": code, "name": name, "min": lo, "max": hi}
+    return {"code": CHEST_ARMOR_TIERS[0][2], "name": CHEST_ARMOR_TIERS[0][3], "min": 0, "max": 999}  # unreachable, kept explicit
+
+
+# --- V1.9: Shield progression — a 7-tier ladder over the same Emberfall
+# rep counter used for chest armor (get_or_create_emberfall_progress /
+# progress_value), per spec's exact thresholds. Same boundaries as
+# CHEST_ARMOR_TIERS above (by design, since V1.12) — kept as a separate
+# table because the two have different tier-0 semantics ("Base Shield" is
+# a real equipped item; "No Chest Armor" is not).
+SHIELD_TIERS = [
+    (0, 999, "BASE_SHIELD", "Base Shield"),
+    (1000, 2499, "WORN_SHIELD", "Worn Shield"),
+    (2500, 4499, "ASHWOOD_SHIELD", "Ashwood Shield"),
+    (4500, 6499, "CINDER_SHIELD", "Cinder Shield"),
+    (6500, 8499, "EMBERGOLD_SHIELD", "Embergold Shield"),
+    (8500, 9999, "OBSIDIAN_SHIELD", "Obsidian Shield"),
+    (10000, None, "LEGENDARY_SHIELD", "Legendary Shield"),
+]
+
+
+def get_shield_tier(emberfall_reps):
+    """Pure function, single source of truth for shield progression — same
+    reps counter as chest armor, independent 7-tier boundary table. Returns
+    a dict with the tier code/display name/range; never raises, never
+    returns None (reps below 0 clamp to the base tier, reps above the top
+    boundary resolve to Legendary, matching the spec's boundary examples
+    exactly: 999->base, 1000->worn, 2499->worn, 2500->ashwood, 4499->ashwood,
+    4500->cinder, 6499->cinder, 6500->embergold, 8499->embergold,
+    8500->obsidian, 9999->obsidian, 10000->legendary)."""
+    reps = max(0, emberfall_reps)
+    for lo, hi, code, name in SHIELD_TIERS:
+        if hi is None:
+            if reps >= lo:
+                return {"code": code, "name": name, "min": lo, "max": hi}
+        elif lo <= reps <= hi:
+            return {"code": code, "name": name, "min": lo, "max": hi}
+    return {"code": SHIELD_TIERS[0][2], "name": SHIELD_TIERS[0][3], "min": 0, "max": 999}  # unreachable, kept explicit
+
+
+
+# (the UNIQUE key achievements reference) is untouched; only the boss
+# (Dragon) triggers realm completion. `location_name` gives each monster a
+# place along Emberfall's local journey map, in the same fixed order as
+# RPG_MONSTER_DEFS (ascending difficulty) — purely a display concept, no
+# new table needed since the order/monster roster itself is the sequence.
+EMBERFALL_MONSTER_THEME = [
+    # internal_name, theme_name,           location_name,     is_boss
+    ("Slime",        "Ember Slime",        "Ashen Gate",       False),
+    ("Goblin",       "Ash Goblin",         "Cinder Road",      False),
+    ("Skeleton",     "Cinder Skeleton",    "Ember Ruins",      False),
+    ("Orc",          "Flame Orc",          "Fallen Shrine",    False),
+    ("Demon",        "Ash Demon",          "Iron Bastion",     False),
+    ("Dragon",       "The Ashen Guardian", "Ashen Guardian",   True),
 ]
 
 
@@ -228,23 +409,23 @@ def get_rpg_rank_from_level(level):
 
 
 # ---------------------------------------------------------------------------
-# V1.3: Rank tiers — purely a visual label derived from Elo. Elo itself
-# remains the only real rating; this is not a second hidden rating.
+# V1.9: Rank tiers — purely a visual label derived from Elo. Elo itself
+# remains the only real rating; this is not a second hidden rating. This is
+# the ONE source of truth for PvP rank names — every screen that shows a
+# rank (Home, Leaderboard, Profile, Public Profile, Friends, match results)
+# reads it from here via the API, nothing recomputes/duplicates this
+# client-side. No artificial ceiling — 2400+ Elo is simply LEGEND forever.
 # ---------------------------------------------------------------------------
 RANK_TIERS = [
     (0, "Bronze"),
-    (1200, "Silver"),
-    (1350, "Gold III"),
-    (1450, "Gold II"),
-    (1550, "Gold I"),
-    (1650, "Platinum III"),
-    (1750, "Platinum II"),
-    (1850, "Platinum I"),
-    (1950, "Diamond III"),
-    (2050, "Diamond II"),
-    (2150, "Diamond I"),
-    (2250, "Master"),
-    (2400, "Grandmaster"),
+    (1000, "Silver"),
+    (1200, "Gold"),
+    (1400, "Platinum"),
+    (1600, "Diamond"),
+    (1800, "Master"),
+    (2000, "Grandmaster"),
+    (2200, "Champion"),
+    (2400, "Legend"),
 ]
 
 
@@ -270,8 +451,11 @@ ACHIEVEMENT_DEFS = [
     ("FIRST_WIN", "First Blood", "Win your first match.", "🏆", "beginner", 30),
     ("TEN_MATCHES", "Getting Started", "Complete 10 matches.", "🔟", "beginner", 40),
     ("HUNDRED_PUSHUPS", "Century", "Reach 100 total push-ups.", "💯", "beginner", 30),
+    ("WARM_UP", "Warm Up", "Complete your first 25 push-ups.", "🔥", "beginner", 25),
+    ("GETTING_STRONGER", "Getting Stronger", "Complete 50 total push-ups.", "💪", "beginner", 35),
     ("TEN_WINS", "Competitor", "Win 10 matches.", "🥇", "competitive", 60),
     ("RIVAL", "Rival", "Defeat the same opponent 3 times.", "😤", "competitive", 50),
+    ("CHALLENGER", "Challenger", "Win 5 matches.", "⚔️", "competitive", 60),
     ("FIVE_WIN_STREAK", "On Fire", "Reach a 5-win streak.", "🔥", "competitive", 60),
     ("TEN_WIN_STREAK", "Unstoppable", "Reach a 10-win streak.", "🚀", "competitive", 100),
     ("REACH_SILVER", "Climber", "Reach the Silver rank.", "🥈", "competitive", 40),
@@ -279,26 +463,52 @@ ACHIEVEMENT_DEFS = [
     ("REACH_1800", "Elite", "Reach 1800 Elo.", "💎", "competitive", 120),
     ("REACH_2000", "Champion", "Reach 2000 Elo.", "👑", "competitive", 200),
     ("PERSONAL_BEST", "Personal Best", "Set a new personal best.", "📈", "performance", 25),
+    ("TWENTY_STRONG", "Twenty Strong", "Reach a personal best of 20 push-ups in one match.", "🔱", "performance", 50),
     ("THOUSAND_PUSHUPS", "Iron Body", "Reach 1,000 total push-ups.", "💪", "performance", 80),
     ("FIVE_THOUSAND_PUSHUPS", "Legend", "Reach 5,000 total push-ups.", "🏋️", "performance", 200),
     ("MONSTER_SLAYER", "Monster Slayer", "Defeat your first RPG monster.", "🗡️", "rpg", 20),
     ("GOBLIN_HUNTER", "Goblin Hunter", "Defeat 10 RPG monsters.", "🛡️", "rpg", 60),
+    ("ASHEN_SURVIVOR", "Ashen Survivor", "Complete the Ashen Gate encounter in Emberfall.", "🚪", "rpg", 50),
+    ("MIDPOINT_WARRIOR", "Midpoint Warrior", "Reach 5,000 Emberfall reps.", "⚡", "rpg", 70),
+    ("OBSIDIAN_BOUND", "Obsidian Bound", "Reach 8,500 Emberfall reps and unlock the Obsidian Shield.", "🖤", "rpg", 80),
+    ("EMBERFALL_RECLAIMED", "Emberfall Reclaimed", "Reach 10,000 Emberfall reps and reclaim Emberfall.", "🔥", "rpg", 150),
     ("DRAGON_SLAYER", "Dragon Slayer", "Defeat the Dragon.", "🐉", "rpg", 150),
     ("RPG_VETERAN", "RPG Veteran", "Reach RPG Level 10.", "🎖️", "rpg", 100),
+    ("REACH_DIAMOND", "Diamond", "Reach 1600 Elo.", "💠", "competitive", 90),
+    ("REACH_LEGEND", "Legend Rank", "Reach 2400 Elo.", "👑", "competitive", 250),
 ]
 
 app = Flask(__name__)
 
 # --- Security: SECRET_KEY -------------------------------------------------
+# V1.13 SECURITY FIX: this used to just print a warning and fall back to a
+# hardcoded string ("dev-only-secret-change-me") — meaning a production
+# deploy that forgot to set SECRET_KEY would silently run anyway, signing
+# every session cookie with a secret anyone reading this source can see.
+# Since Flask signs session cookies with this key, knowing it lets an
+# attacker FORGE a valid session for any user_id — this is a real account-
+# takeover path, not a cosmetic issue. Now: refusing to start at all
+# unless SECRET_KEY is set, OR the developer explicitly opts into the
+# insecure fallback for local exploration via ALLOW_INSECURE_DEV_SECRET=1.
 _env_secret = os.environ.get("SECRET_KEY")
 if _env_secret:
     app.secret_key = _env_secret
-else:
+elif os.environ.get("ALLOW_INSECURE_DEV_SECRET") == "1":
     app.secret_key = "dev-only-secret-change-me"
     print(
-        "\n⚠️  WARNING: SECRET_KEY environment variable is not set.\n"
-        "   Using an insecure default — fine for local testing, but NEVER\n"
-        "   deploy this publicly without setting a real SECRET_KEY.\n"
+        "\n⚠️  WARNING: SECRET_KEY is not set — running with the insecure dev "
+        "fallback because ALLOW_INSECURE_DEV_SECRET=1 was explicitly set.\n"
+        "   NEVER deploy this publicly without a real SECRET_KEY.\n"
+    )
+else:
+    raise SystemExit(
+        "\n\nFATAL: SECRET_KEY environment variable is not set.\n"
+        "Refusing to start — running without it would sign session cookies "
+        "with a publicly-known fallback value, letting anyone forge a "
+        "session for any account.\n\n"
+        "Set SECRET_KEY to a real random secret, or (local development "
+        "only) set ALLOW_INSECURE_DEV_SECRET=1 to explicitly accept the "
+        "insecure fallback.\n"
     )
 
 # --- Security: session cookie hardening ------------------------------------
@@ -393,7 +603,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT,
-            elo INTEGER NOT NULL DEFAULT 1200,
+            elo INTEGER NOT NULL DEFAULT 1000,
             wins INTEGER NOT NULL DEFAULT 0,
             losses INTEGER NOT NULL DEFAULT 0,
             draws INTEGER NOT NULL DEFAULT 0,
@@ -529,7 +739,7 @@ def init_db():
     if "xp" not in user_cols_v13:
         db.execute("ALTER TABLE users ADD COLUMN xp INTEGER NOT NULL DEFAULT 0")
     if "peak_elo" not in user_cols_v13:
-        db.execute("ALTER TABLE users ADD COLUMN peak_elo INTEGER NOT NULL DEFAULT 1200")
+        db.execute("ALTER TABLE users ADD COLUMN peak_elo INTEGER NOT NULL DEFAULT 1000")
         # Backfill: best available estimate for existing users is their
         # current Elo (we have no historical high-water-mark). Peak Elo
         # only ever increases from here forward, so this is a safe floor.
@@ -757,6 +967,195 @@ def init_db():
             (name, desc, max_hp, difficulty, xp_reward, gold_reward, icon),
         )
 
+    # --- V1.6 migration: email/Google auth, password reset, profile
+    # picture, profile privacy -------------------------------------------
+    # All new columns are NULLable additions to the existing `users` table
+    # (never a rebuild), so every pre-existing account keeps working with
+    # zero data loss — an existing user simply has email=NULL/google_id=NULL
+    # until they choose to add one.
+    user_cols_v16 = _table_columns(db, "users")
+    if "email" not in user_cols_v16:
+        db.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    if "google_id" not in user_cols_v16:
+        db.execute("ALTER TABLE users ADD COLUMN google_id TEXT")
+    if "profile_picture_path" not in user_cols_v16:
+        db.execute("ALTER TABLE users ADD COLUMN profile_picture_path TEXT")
+    if "profile_visibility" not in user_cols_v16:
+        db.execute("ALTER TABLE users ADD COLUMN profile_visibility TEXT NOT NULL DEFAULT 'public'")
+    if "match_history_visibility" not in user_cols_v16:
+        db.execute("ALTER TABLE users ADD COLUMN match_history_visibility TEXT NOT NULL DEFAULT 'public'")
+    # Partial unique indexes: NULL emails/google_ids don't collide with each
+    # other (many users can share email=NULL), only real values must be
+    # unique — this is what lets existing passwordless-email accounts coexist.
+    db.executescript(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
+            ON users(email) WHERE email IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id
+            ON users(google_id) WHERE google_id IS NOT NULL;
+
+        -- Password reset tokens: we store a SHA-256 HASH of the token, never
+        -- the token itself, exactly like a password. The raw token only
+        -- ever exists in the emailed link and briefly in memory server-side.
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            used_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reset_tokens_user ON password_reset_tokens(user_id);
+
+        CREATE TABLE IF NOT EXISTS profile_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reporter_id INTEGER NOT NULL REFERENCES users(id),
+            reported_user_id INTEGER NOT NULL REFERENCES users(id),
+            reason TEXT,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_profile_reports_target ON profile_reports(reported_user_id);
+        """
+    )
+
+    # --- V1.7 migration: RPG World / Five Realms --------------------------
+    # Internal monster `name` (the UNIQUE key achievements already
+    # reference, e.g. "Dragon") is left untouched on purpose — `theme_name`
+    # is a display-layer addition only. `is_boss` marks which monster ends
+    # a realm; only Dragon is a boss today, but the column supports more
+    # per-realm bosses later without another migration.
+    monster_cols_v17 = _table_columns(db, "monsters")
+    if "theme_name" not in monster_cols_v17:
+        db.execute("ALTER TABLE monsters ADD COLUMN theme_name TEXT")
+    if "realm_code" not in monster_cols_v17:
+        db.execute("ALTER TABLE monsters ADD COLUMN realm_code TEXT")
+    if "is_boss" not in monster_cols_v17:
+        db.execute("ALTER TABLE monsters ADD COLUMN is_boss INTEGER NOT NULL DEFAULT 0")
+    if "location_name" not in monster_cols_v17:
+        db.execute("ALTER TABLE monsters ADD COLUMN location_name TEXT")
+
+    db.executescript(
+        """
+        -- Static world data — one row per realm, always the same 5 rows.
+        -- `playable` for the 4 not-yet-built realms is hardcoded 0 here —
+        -- NOT derived from player state — because no exercise detection
+        -- exists for them yet. This is an honesty guard, not a
+        -- progression gate: it can't be unlocked by playing, only by us
+        -- actually shipping detection for that exercise.
+        CREATE TABLE IF NOT EXISTS realms (
+            code TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            exercise_type TEXT NOT NULL,
+            theme TEXT NOT NULL,
+            order_index INTEGER NOT NULL,
+            playable INTEGER NOT NULL DEFAULT 0,
+            equipment_slot TEXT NOT NULL,
+            reward_name TEXT NOT NULL
+        );
+
+        -- One row per (user, realm) once they've engaged with that realm.
+        -- Absence of a row = not yet started. Only 'emberfall' can ever
+        -- reach 'completed' today.
+        CREATE TABLE IF NOT EXISTS player_realm_progress (
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            realm_code TEXT NOT NULL REFERENCES realms(code),
+            status TEXT NOT NULL DEFAULT 'active',
+            started_at REAL NOT NULL,
+            completed_at REAL,
+            PRIMARY KEY (user_id, realm_code)
+        );
+
+        -- Modular equipment slots — chest is the only one populated in V1,
+        -- but head/shoulders/arms/legs/boots/accessories all work the same
+        -- way the moment a future realm grants them, with no schema change.
+        CREATE TABLE IF NOT EXISTS player_equipment (
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            slot TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            realm_code TEXT NOT NULL REFERENCES realms(code),
+            acquired_at REAL NOT NULL,
+            PRIMARY KEY (user_id, slot)
+        );
+        """
+    )
+
+    # --- V1.8: Emberfall long-form (10,000-rep) progression ---------------
+    # `progress_value` is the cumulative count of server-validated push-up
+    # reps applied toward Emberfall — incremented in lockstep with the
+    # SAME reps number already used for combat damage in submit_hit, never
+    # a separately-trusted value. This is what drives both the current
+    # location and the current chest-armor tier now, replacing the old
+    # "boss defeat completes the realm" trigger. Runs AFTER the tables
+    # above so it works identically on a fresh DB and an upgraded one.
+    realm_progress_cols_v18 = _table_columns(db, "player_realm_progress")
+    if "progress_value" not in realm_progress_cols_v18:
+        db.execute("ALTER TABLE player_realm_progress ADD COLUMN progress_value INTEGER NOT NULL DEFAULT 0")
+        # Backfill: any user who already completed Emberfall under the OLD
+        # "defeat the boss once" rule (before this 10,000-rep system
+        # existed) keeps their completed status — they are NOT reset — but
+        # their progress display would otherwise show 0/10,000 while still
+        # reading "completed", which is confusing. One-time backfill only,
+        # guarded by the ALTER above so it never re-runs.
+        db.execute(
+            "UPDATE player_realm_progress SET progress_value = ? WHERE realm_code = 'emberfall' AND status = 'completed'",
+            (EMBERFALL_TOTAL_REPS,),
+        )
+        db.execute(
+            "UPDATE player_equipment SET item_name = ? WHERE slot = 'chest' AND item_name = 'Chest Armor'",
+            ("Legendary Emberplate",),
+        )
+
+    # --- V1.11: first-time push-up onboarding gate --------------------------
+    # Persistent PER-USER flag (not localStorage) — survives device/browser
+    # changes, matches the spec's explicit "store a persistent per-user
+    # flag" requirement. Existing accounts are backfilled to "already
+    # seen" in the SAME migration step so nobody who has used the app
+    # before gets interrupted; only genuinely new signups (via the column
+    # default) start at 0/unseen.
+    user_cols_v111 = _table_columns(db, "users")
+    if "has_seen_pushup_how_it_works" not in user_cols_v111:
+        db.execute("ALTER TABLE users ADD COLUMN has_seen_pushup_how_it_works INTEGER NOT NULL DEFAULT 0")
+        db.execute("UPDATE users SET has_seen_pushup_how_it_works = 1")
+
+    # --- V1.14: first-time RPG onboarding gate (SEPARATE from the PvP one
+    # above) — a player who has already seen the PvP "How It Works" but
+    # never entered RPG still needs the RPG-specific game-loop explainer,
+    # and vice versa. Same persistent-per-account pattern, same existing-
+    # user backfill so nobody who has already used RPG gets interrupted.
+    user_cols_v114 = _table_columns(db, "users")
+    if "has_seen_rpg_how_it_works" not in user_cols_v114:
+        db.execute("ALTER TABLE users ADD COLUMN has_seen_rpg_how_it_works INTEGER NOT NULL DEFAULT 0")
+        # Backfill: anyone who already has an rpg_players row has
+        # necessarily already been through the RPG entry flow before.
+        db.execute(
+            "UPDATE users SET has_seen_rpg_how_it_works = 1 WHERE id IN (SELECT user_id FROM rpg_players)"
+        )
+
+    # `realms.subtitle` added in a follow-up pass — additive ALTER since
+    # the table may already exist from an earlier V1.7 run.
+    realm_cols_v17b = _table_columns(db, "realms")
+    if "subtitle" not in realm_cols_v17b:
+        db.execute("ALTER TABLE realms ADD COLUMN subtitle TEXT NOT NULL DEFAULT ''")
+
+    # Seed the five realms (idempotent) and theme Emberfall's monster
+    # roster — internal name/difficulty/rewards untouched, only
+    # presentation columns are set.
+    for code, display_name, subtitle, exercise_type, theme, order_index, playable, slot, reward_name in REALM_DEFS:
+        db.execute(
+            """INSERT INTO realms (code, display_name, subtitle, exercise_type, theme, order_index, playable, equipment_slot, reward_name)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(code) DO UPDATE SET
+                 display_name=excluded.display_name, subtitle=excluded.subtitle, exercise_type=excluded.exercise_type,
+                 theme=excluded.theme, order_index=excluded.order_index, playable=excluded.playable,
+                 equipment_slot=excluded.equipment_slot, reward_name=excluded.reward_name""",
+            (code, display_name, subtitle, exercise_type, theme, order_index, playable, slot, reward_name),
+        )
+    for internal_name, theme_name, location_name, is_boss in EMBERFALL_MONSTER_THEME:
+        db.execute(
+            "UPDATE monsters SET theme_name = ?, realm_code = 'emberfall', location_name = ?, is_boss = ? WHERE name = ?",
+            (theme_name, location_name, 1 if is_boss else 0, internal_name),
+        )
+
     db.commit()
     db.close()
 
@@ -810,6 +1209,10 @@ def signup():
     body = request.json or {}
     username = body.get("username", "").strip()
     password = body.get("password", "")
+    # Email is OPTIONAL at signup — existing accounts have none, and we're
+    # not forcing anyone to add one. It only unlocks "forgot password" and
+    # "continue with Google" account linking once/if the user sets it.
+    email = (body.get("email") or "").strip().lower() or None
 
     if not username or not password:
         return jsonify(error="username and password required"), 400
@@ -821,15 +1224,19 @@ def signup():
         return jsonify(error=f"password must be at least {MIN_PASSWORD_LENGTH} characters"), 400
     if username.lower() == BOT_USERNAME.lower():
         return jsonify(error="that username is reserved"), 400
+    if email is not None and not _is_valid_email(email):
+        return jsonify(error="invalid email address"), 400
 
     db = get_db()
     existing = db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
     if existing is not None:
         return jsonify(error="username already taken"), 409
+    if email is not None and db.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone():
+        return jsonify(error="an account with that email already exists"), 409
 
     cur = db.execute(
-        "INSERT INTO users (username, password_hash, elo, created_at) VALUES (?, ?, ?, ?)",
-        (username, generate_password_hash(password), STARTING_ELO, now_iso()),
+        "INSERT INTO users (username, password_hash, email, elo, created_at) VALUES (?, ?, ?, ?, ?)",
+        (username, generate_password_hash(password), email, STARTING_ELO, now_iso()),
     )
     db.commit()
     user_id = cur.lastrowid
@@ -870,6 +1277,268 @@ def me():
         session.pop("user_id", None)
         return jsonify(error="not logged in"), 401
     return jsonify(user_to_dict(row))
+
+
+@app.route("/api/pushup-how-it-works-seen", methods=["POST"])
+@login_required
+def mark_pushup_how_it_works_seen():
+    """Server-authoritative, per-account — set exactly once the player has
+    actually gone through the onboarding, never re-set to unseen."""
+    db = get_db()
+    db.execute("UPDATE users SET has_seen_pushup_how_it_works = 1 WHERE id = ?", (session["user_id"],))
+    db.commit()
+    return jsonify(status="ok")
+
+
+@app.route("/api/rpg-how-it-works-seen", methods=["POST"])
+@login_required
+def mark_rpg_how_it_works_seen():
+    """SEPARATE flag from the PvP one above — a player can have seen one
+    without the other, depending on which mode they touched first."""
+    db = get_db()
+    db.execute("UPDATE users SET has_seen_rpg_how_it_works = 1 WHERE id = ?", (session["user_id"],))
+    db.commit()
+    return jsonify(status="ok")
+
+
+# ---------------------------------------------------------------------------
+# V1.6 — email validation + email delivery (pluggable, honest about state)
+# ---------------------------------------------------------------------------
+import re as _re
+_EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _is_valid_email(email):
+    return bool(email) and len(email) <= 254 and bool(_EMAIL_RE.match(email))
+
+
+def send_email(to_address, subject, body_text):
+    """Sends a real email via SMTP if SMTP_* env vars are configured.
+    Returns True/False for whether an email was actually dispatched — the
+    caller must NEVER tell the user "email sent" unless this returned True.
+    If not configured, logs the message server-side (useful in dev/local
+    testing) and returns False; it does NOT fabricate a successful send."""
+    if not EMAIL_CONFIGURED:
+        print(f"\n[send_email] SMTP not configured — NOT actually sent.\n  To: {to_address}\n  Subject: {subject}\n  Body:\n{body_text}\n")
+        return False
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body_text)
+        msg["Subject"] = subject
+        msg["From"] = SMTP_FROM_ADDRESS
+        msg["To"] = to_address
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM_ADDRESS, [to_address], msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[send_email] FAILED to send to {to_address}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# V1.6 — Routes — API — forgot / reset password
+# ---------------------------------------------------------------------------
+@app.route("/api/auth/forgot-password", methods=["POST"])
+@rate_limit("5 per minute")
+def forgot_password():
+    """Always returns the same generic response regardless of whether the
+    email exists — this is what prevents account enumeration. The actual
+    reset token is a cryptographically random value; only its SHA-256 hash
+    is stored, so a DB leak alone can't be used to reset anyone's password."""
+    body = request.json or {}
+    email = (body.get("email") or "").strip().lower()
+    generic = jsonify(status="if an account with that email exists, a reset link has been sent")
+
+    if not email or not _is_valid_email(email):
+        return generic  # still generic — don't reveal validation details either
+
+    db = get_db()
+    user = db.execute("SELECT id, username FROM users WHERE email = ?", (email,)).fetchone()
+    if user is None:
+        return generic
+
+    import secrets, hashlib
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    now = time.time()
+    db.execute(
+        "INSERT INTO password_reset_tokens (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (user["id"], token_hash, now, now + PASSWORD_RESET_TOKEN_TTL_SECONDS),
+    )
+    db.commit()
+
+    # Single-page app — no separate /reset-password route exists, so the
+    # link points at the app root with a query param the frontend reads on
+    # load (see app.js bootstrap) rather than a server-side page route.
+    reset_link = f"{APP_PUBLIC_URL}/?reset_token={raw_token}"
+    sent = send_email(
+        email, "Reset your VISOREP password",
+        f"Hi {user['username']},\n\nUse this link to reset your VISOREP password "
+        f"(expires in {PASSWORD_RESET_TOKEN_TTL_SECONDS // 60} minutes):\n\n{reset_link}\n\n"
+        f"If you didn't request this, you can ignore this email.",
+    )
+    if not sent and not EMAIL_CONFIGURED:
+        # Dev/local convenience ONLY: with no email provider configured we
+        # cannot actually deliver the link, so hand it back directly instead
+        # of silently pretending it went out. In production, once SMTP_* is
+        # set, EMAIL_CONFIGURED is True and this branch never runs.
+        return jsonify(status="email not configured on this server — dev mode", reset_link=reset_link)
+    return generic
+
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+@rate_limit("10 per minute")
+def reset_password():
+    body = request.json or {}
+    raw_token = body.get("token") or ""
+    new_password = body.get("password") or ""
+
+    if not raw_token:
+        return jsonify(error="reset token required"), 400
+    if len(new_password) < MIN_PASSWORD_LENGTH:
+        return jsonify(error=f"password must be at least {MIN_PASSWORD_LENGTH} characters"), 400
+
+    import hashlib
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM password_reset_tokens WHERE token_hash = ?", (token_hash,)
+    ).fetchone()
+    if row is None or row["used_at"] is not None or row["expires_at"] < time.time():
+        return jsonify(error="this reset link is invalid or has expired"), 400
+
+    db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (generate_password_hash(new_password), row["user_id"]))
+    db.execute("UPDATE password_reset_tokens SET used_at = ? WHERE id = ?", (time.time(), row["id"]))
+    # Invalidate any OTHER outstanding reset tokens for this user too — a
+    # single successful reset should kill every other link that might be
+    # sitting in an old email/inbox.
+    db.execute(
+        "UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
+        (time.time(), row["user_id"]),
+    )
+    db.commit()
+    return jsonify(status="password reset — you can now log in")
+
+
+# ---------------------------------------------------------------------------
+# V1.6 — Routes — API — Google OAuth (Continue with Google)
+# ---------------------------------------------------------------------------
+@app.route("/api/auth/google/status")
+def google_oauth_status():
+    """Lets the frontend know whether to show the Google button at all —
+    it's meaningless without GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI configured."""
+    return jsonify(available=GOOGLE_OAUTH_CONFIGURED)
+
+
+@app.route("/api/auth/google/login")
+def google_oauth_login():
+    if not GOOGLE_OAUTH_CONFIGURED:
+        return jsonify(error="Google login is not configured on this server"), 503
+    import secrets
+    from urllib.parse import urlencode
+    state = secrets.token_urlsafe(24)
+    session[GOOGLE_OAUTH_STATE_SESSION_KEY] = state
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "prompt": "select_account",
+    }
+    return redirect(f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}")
+
+
+@app.route("/api/auth/google/callback")
+def google_oauth_callback():
+    """Standard OAuth2 authorization-code exchange + ID-token verification.
+    NOTE: this cannot be exercised end-to-end without real Google OAuth
+    credentials and a publicly reachable redirect URI, so it has only been
+    exercised via code review here, not a live Google login — see the final
+    report."""
+    if not GOOGLE_OAUTH_CONFIGURED:
+        return jsonify(error="Google login is not configured on this server"), 503
+
+    error = request.args.get("error")
+    if error:
+        return redirect(f"{APP_PUBLIC_URL}/?google_error={error}")
+
+    state = request.args.get("state")
+    if not state or state != session.pop(GOOGLE_OAUTH_STATE_SESSION_KEY, None):
+        return jsonify(error="invalid OAuth state — possible CSRF, please try again"), 400
+
+    code = request.args.get("code")
+    if not code:
+        return jsonify(error="missing authorization code"), 400
+
+    try:
+        token_resp = requests.post(GOOGLE_TOKEN_ENDPOINT, data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        }, timeout=10)
+        token_resp.raise_for_status()
+        id_token_jwt = token_resp.json()["id_token"]
+    except Exception as e:
+        return jsonify(error=f"failed to exchange authorization code: {e}"), 502
+
+    # Signature/issuer/audience/expiry verification via Google's official
+    # library — deliberately NOT hand-rolled, since a hand-rolled JWT
+    # verifier is exactly the kind of shortcut that turns into an auth
+    # bypass. Requires `google-auth` (added to requirements.txt).
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_auth_requests
+        claims = google_id_token.verify_oauth2_token(
+            id_token_jwt, google_auth_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except Exception as e:
+        return jsonify(error=f"invalid Google ID token: {e}"), 401
+
+    google_sub = claims["sub"]
+    google_email = (claims.get("email") or "").strip().lower()
+    email_verified = bool(claims.get("email_verified"))
+
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE google_id = ?", (google_sub,)).fetchone()
+
+    if user is None and google_email and email_verified:
+        # Link to an existing password account with the SAME, Google-VERIFIED
+        # email — only auto-linked when Google itself vouches the email is
+        # verified, so this can't be used to hijack an account via a spoofed
+        # unverified address.
+        existing = db.execute("SELECT * FROM users WHERE email = ?", (google_email,)).fetchone()
+        if existing is not None:
+            db.execute("UPDATE users SET google_id = ? WHERE id = ?", (google_sub, existing["id"]))
+            db.commit()
+            user = db.execute("SELECT * FROM users WHERE id = ?", (existing["id"],)).fetchone()
+
+    if user is None:
+        # Brand-new account via Google. Username derived from the email
+        # local-part, de-duplicated if taken; no password set (password_hash
+        # stays NULL — username/password login simply won't work for this
+        # account unless they later set one, which is intentional).
+        base_username = (google_email.split("@")[0] if google_email else f"user{google_sub[:8]}")
+        base_username = _re.sub(r"[^A-Za-z0-9_]", "", base_username)[:MAX_USERNAME_LENGTH] or "user"
+        username = base_username
+        suffix = 1
+        while db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone():
+            suffix += 1
+            username = f"{base_username}{suffix}"[:MAX_USERNAME_LENGTH]
+        cur = db.execute(
+            "INSERT INTO users (username, password_hash, email, google_id, elo, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (username, None, google_email or None, google_sub, STARTING_ELO, now_iso()),
+        )
+        db.commit()
+        user = db.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+
+    session["user_id"] = user["id"]
+    return redirect(f"{APP_PUBLIC_URL}/?google_login=success")
 
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1672,7 @@ def determine_bot_target_reps(player_elo):
     There is no existing Elo-to-performance dataset in this codebase to
     draw from (checked before writing this), so this is a reasoned,
     clearly-approximate model, not one calibrated against real match data:
-    STARTING_ELO (1200) is treated as roughly a ~22-rep/60s performance,
+    STARTING_ELO (1000) is treated as roughly a ~22-rep/60s performance,
     scaling modestly with Elo from there. Expect to tune once real match
     data exists — these are starting values, not sacred constants.
     """
@@ -1651,6 +2320,34 @@ def get_profile():
         for a in all_achievements
     ]
 
+    # V1.7 — RPG identity summary for the profile. Deliberately a plain
+    # SELECT, not get_or_create_rpg_player: viewing your own profile
+    # should never have the side effect of creating RPG rows for someone
+    # who has never touched the RPG at all.
+    rpg_row = db.execute("SELECT * FROM rpg_players WHERE user_id = ?", (user_id,)).fetchone()
+    rpg_summary = None
+    if rpg_row is not None:
+        realms_completed = db.execute(
+            "SELECT COUNT(*) c FROM player_realm_progress WHERE user_id = ? AND status = 'completed'", (user_id,)
+        ).fetchone()["c"]
+        # Plain SELECT here too (not get_or_create_emberfall_progress) —
+        # same reasoning: viewing a profile must stay side-effect-free.
+        emberfall_row = db.execute(
+            "SELECT progress_value FROM player_realm_progress WHERE user_id = ? AND realm_code = 'emberfall'", (user_id,)
+        ).fetchone()
+        emberfall_progress_value = emberfall_row["progress_value"] if emberfall_row else 0
+        rpg_summary = {
+            "rpg_level": get_rpg_level_from_xp(rpg_row["rpg_xp"]),
+            "rpg_rank": get_rpg_rank_from_level(get_rpg_level_from_xp(rpg_row["rpg_xp"])),
+            "realms_completed": realms_completed,
+            "realms_total": len(REALM_DEFS),
+            "emberfall_progress_value": emberfall_progress_value,
+            "emberfall_progress_total": EMBERFALL_TOTAL_REPS,
+            "current_armor": get_chest_armor_tier(emberfall_progress_value)["name"],
+            "current_shield": get_shield_tier(emberfall_progress_value)["name"],
+            "equipment": get_player_equipment(db, user_id),
+        }
+
     return jsonify({
         "id": u["id"],
         "username": u["username"],
@@ -1679,16 +2376,23 @@ def get_profile():
         "longest_streak": u["longest_streak"],
         "achievements": achievements,
         "avatar_count": AVATAR_COUNT,
+        "email": u["email"],
+        "has_google_login": u["google_id"] is not None,
+        "profile_picture_url": profile_picture_url_for(u["id"], u["profile_picture_path"]),
+        "profile_visibility": u["profile_visibility"],
+        "match_history_visibility": u["match_history_visibility"],
+        "rpg": rpg_summary,
     })
 
 
 @app.route("/api/profile", methods=["PUT"])
 @login_required
 def update_profile():
-    """Lets the authenticated user edit ONLY their own country/bio/avatar.
-    Username is intentionally not editable in V1.3. Nothing here can touch
-    Elo, XP, level, wins, or any other server-controlled progression value
-    — those fields simply aren't accepted from the request body."""
+    """Lets the authenticated user edit ONLY their own country/bio/avatar/
+    email/privacy settings. Username is intentionally not editable in V1.3.
+    Nothing here can touch Elo, XP, level, wins, or any other
+    server-controlled progression value — those fields simply aren't
+    accepted from the request body."""
     body = request.json or {}
     user_id = session["user_id"]
     db = get_db()
@@ -1714,6 +2418,28 @@ def update_profile():
             return jsonify(error=f"avatar_id must be an integer from 1 to {AVATAR_COUNT}"), 400
         updates["avatar_id"] = avatar_id
 
+    if "email" in body:
+        email = (body["email"] or "").strip().lower() or None
+        if email is not None:
+            if not _is_valid_email(email):
+                return jsonify(error="invalid email address"), 400
+            clash = db.execute("SELECT id FROM users WHERE email = ? AND id != ?", (email, user_id)).fetchone()
+            if clash:
+                return jsonify(error="an account with that email already exists"), 409
+        updates["email"] = email
+
+    if "profile_visibility" in body:
+        pv = body["profile_visibility"]
+        if pv not in VALID_PROFILE_VISIBILITY:
+            return jsonify(error=f"profile_visibility must be one of {sorted(VALID_PROFILE_VISIBILITY)}"), 400
+        updates["profile_visibility"] = pv
+
+    if "match_history_visibility" in body:
+        mv = body["match_history_visibility"]
+        if mv not in VALID_MATCH_HISTORY_VISIBILITY:
+            return jsonify(error=f"match_history_visibility must be one of {sorted(VALID_MATCH_HISTORY_VISIBILITY)}"), 400
+        updates["match_history_visibility"] = mv
+
     if not updates:
         return jsonify(error="nothing to update"), 400
 
@@ -1721,6 +2447,170 @@ def update_profile():
     db.execute(f"UPDATE users SET {set_clause} WHERE id = ?", (*updates.values(), user_id))
     db.commit()
     return get_profile()
+
+
+# ---------------------------------------------------------------------------
+# V1.6 — Routes — API — profile picture upload/serve
+# ---------------------------------------------------------------------------
+# Real face NOT required — anime/artwork/nature/game-art/memes/own photos are
+# all fine. This pipeline is about CONTENT SAFETY, not identity verification:
+#   1. reject anything Pillow can't genuinely decode as an image (blocks a
+#      renamed .exe/.php/etc regardless of what extension it was uploaded as)
+#   2. re-encode server-side to a fixed-size JPEG — this drops EXIF/metadata
+#      and means whatever bytes get served are ALWAYS ones we generated,
+#      never the user's original upload
+#   3. never serve it as a static/executable file — always through this
+#      route with an explicit image/jpeg content-type
+#
+# HONESTY NOTE (see final report): there is no automated visual content
+# classifier wired in here — no such moderation service/API key is
+# available in this environment. Rather than fabricate an "AI moderation"
+# step that doesn't actually exist, this pass ships the safe upload
+# pipeline above plus a report mechanism (below) for human follow-up.
+def _validate_and_reencode_image(file_storage):
+    """Returns (jpeg_bytes, error_message). error_message is None on success."""
+    from PIL import Image
+    import io as _io
+
+    raw = file_storage.read(PROFILE_PICTURE_MAX_BYTES + 1)
+    if len(raw) > PROFILE_PICTURE_MAX_BYTES:
+        return None, f"image must be at most {PROFILE_PICTURE_MAX_BYTES // (1024*1024)}MB"
+    if not raw:
+        return None, "empty file"
+
+    try:
+        img = Image.open(_io.BytesIO(raw))
+        img.verify()  # cheap structural check; the file must be reopened after this
+        img = Image.open(_io.BytesIO(raw))
+        img.load()    # forces full decode now, not lazily later — catches truncated/malformed data
+    except Exception:
+        return None, "file is not a valid image"
+
+    if img.format not in ("JPEG", "PNG", "WEBP"):
+        return None, "only JPG, PNG, or WebP images are allowed"
+    # This is a decompression-bomb/DoS guard only — NOT a "resize your photo
+    # first" requirement. A normal phone photo (e.g. 3024x4032) is nowhere
+    # near this; anything under it is auto-resized below regardless of size.
+    if img.width > PROFILE_PICTURE_MAX_DECODE_DIMENSION or img.height > PROFILE_PICTURE_MAX_DECODE_DIMENSION:
+        return None, "image is too large — please choose a smaller photo"
+    if img.width < 32 or img.height < 32:
+        return None, "image is too small"
+
+    # Center-crop to square, resize to the fixed output size, drop alpha/
+    # metadata by flattening onto white and re-encoding fresh as JPEG.
+    img = img.convert("RGB")
+    side = min(img.width, img.height)
+    left = (img.width - side) // 2
+    top = (img.height - side) // 2
+    img = img.crop((left, top, left + side, top + side)).resize(
+        (PROFILE_PICTURE_OUTPUT_SIZE, PROFILE_PICTURE_OUTPUT_SIZE), Image.LANCZOS
+    )
+    out = _io.BytesIO()
+    img.save(out, format="JPEG", quality=88)  # fresh encode — no EXIF carried over
+    return out.getvalue(), None
+
+
+@app.route("/api/profile/picture", methods=["POST"])
+@login_required
+@rate_limit("10 per hour")
+def upload_profile_picture():
+    if "picture" not in request.files:
+        return jsonify(error="no file uploaded (expected form field 'picture')"), 400
+
+    jpeg_bytes, err = _validate_and_reencode_image(request.files["picture"])
+    if err:
+        return jsonify(error=err), 400
+
+    import uuid
+    os.makedirs(PROFILE_PICTURE_DIR, exist_ok=True)
+    filename = f"{uuid.uuid4().hex}.jpg"  # unpredictable — not the original filename
+    path = os.path.join(PROFILE_PICTURE_DIR, filename)
+    with open(path, "wb") as f:
+        f.write(jpeg_bytes)
+
+    user_id = session["user_id"]
+    db = get_db()
+    old = db.execute("SELECT profile_picture_path FROM users WHERE id = ?", (user_id,)).fetchone()
+    db.execute("UPDATE users SET profile_picture_path = ? WHERE id = ?", (filename, user_id))
+    db.commit()
+
+    # Best-effort cleanup of the old file now that the DB no longer points to it.
+    if old and old["profile_picture_path"]:
+        try:
+            os.remove(os.path.join(PROFILE_PICTURE_DIR, old["profile_picture_path"]))
+        except OSError:
+            pass
+
+    return jsonify(status="uploaded", profile_picture_url=profile_picture_url_for(user_id, filename))
+
+
+@app.route("/api/profile/picture", methods=["DELETE"])
+@login_required
+def delete_profile_picture():
+    user_id = session["user_id"]
+    db = get_db()
+    row = db.execute("SELECT profile_picture_path FROM users WHERE id = ?", (user_id,)).fetchone()
+    db.execute("UPDATE users SET profile_picture_path = NULL WHERE id = ?", (user_id,))
+    db.commit()
+    if row and row["profile_picture_path"]:
+        try:
+            os.remove(os.path.join(PROFILE_PICTURE_DIR, row["profile_picture_path"]))
+        except OSError:
+            pass
+    return jsonify(status="removed")
+
+
+@app.route("/api/profile/picture/<int:user_id>")
+def serve_profile_picture(user_id):
+    """Authorization is checked on EVERY request, per the target user's own
+    profile_visibility setting — not just at upload time. 'public' pictures
+    are servable to anyone (including logged-out visitors, same as any
+    public avatar); 'friends' pictures require the requester to be logged
+    in AND actually friends with the target — this is what stops
+    User A -> arbitrary URL -> User B's private picture."""
+    db = get_db()
+    target = db.execute(
+        "SELECT profile_picture_path, profile_visibility FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if target is None or not target["profile_picture_path"]:
+        return jsonify(error="no profile picture"), 404
+
+    if target["profile_visibility"] == "friends":
+        requester_id = session.get("user_id")
+        if not requester_id or (requester_id != user_id and not are_friends(db, requester_id, user_id)):
+            return jsonify(error="this profile picture is friends-only"), 403
+
+    path = os.path.join(PROFILE_PICTURE_DIR, target["profile_picture_path"])
+    if not os.path.isfile(path):
+        return jsonify(error="no profile picture"), 404
+    with open(path, "rb") as f:
+        data = f.read()
+    resp = app.response_class(data, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "private, max-age=300"
+    return resp
+
+
+@app.route("/api/profile/report", methods=["POST"])
+@login_required
+def report_profile():
+    """Lightweight report mechanism per the spec — flags a user's profile
+    picture/content for manual review. No automated moderation model is
+    wired in here (none is available in this environment); this simply
+    records the report so a human can look at it."""
+    body = request.json or {}
+    reported_user_id = body.get("user_id")
+    reason = (body.get("reason") or "").strip()[:500]
+    if not isinstance(reported_user_id, int) or isinstance(reported_user_id, bool):
+        return jsonify(error="valid user_id required"), 400
+    db = get_db()
+    if db.execute("SELECT id FROM users WHERE id = ?", (reported_user_id,)).fetchone() is None:
+        return jsonify(error="user not found"), 404
+    db.execute(
+        "INSERT INTO profile_reports (reporter_id, reported_user_id, reason, created_at) VALUES (?, ?, ?, ?)",
+        (session["user_id"], reported_user_id, reason or None, time.time()),
+    )
+    db.commit()
+    return jsonify(status="reported")
 
 
 # ---------------------------------------------------------------------------
@@ -1819,9 +2709,92 @@ def public_profile(username):
         return jsonify(error="player not found"), 404
 
     my_id = session["user_id"]
+    is_self = row["id"] == my_id
+    is_friend = (not is_self) and are_friends(db, my_id, row["id"])
+
+    # V1.13 SECURITY FIX: profile_visibility="friends" must restrict ALL
+    # stats (Elo, wins/losses, bio, country, streaks — everything
+    # public_user_dict carries), not just the RPG/achievement fields that
+    # were added below it. The previous version called public_user_dict()
+    # unconditionally BEFORE checking `restricted`, so a stranger could
+    # still see a "friends only" player's full PvP stats — only RPG data
+    # was actually gated. Found via a live test (a genuine second account
+    # querying another account's friends-only profile), not just code
+    # review. Fixed: the restricted branch now builds a minimal dict of
+    # its own instead of starting from the full public_user_dict().
+    restricted = row["profile_visibility"] == "friends" and not is_self and not is_friend
+
+    if restricted:
+        last_seen = row["last_seen"]
+        online = bool(last_seen and (time.time() - last_seen) < ONLINE_THRESHOLD_SECONDS)
+        data = {
+            "id": row["id"],
+            "username": row["username"],
+            "avatar_id": row["avatar_id"],
+            "online": online,
+            "restricted": True,
+        }
+        if is_self:
+            data["relationship"] = "self"
+        elif is_friend:
+            data["relationship"] = "friends"
+        else:
+            outgoing = db.execute(
+                "SELECT id FROM friend_requests WHERE sender_id = ? AND receiver_id = ? AND status = 'pending'",
+                (my_id, row["id"]),
+            ).fetchone()
+            incoming = db.execute(
+                "SELECT id FROM friend_requests WHERE sender_id = ? AND receiver_id = ? AND status = 'pending'",
+                (row["id"], my_id),
+            ).fetchone()
+            if outgoing:
+                data["relationship"] = "request_sent"
+                data["request_id"] = outgoing["id"]
+            elif incoming:
+                data["relationship"] = "request_received"
+                data["request_id"] = incoming["id"]
+            else:
+                data["relationship"] = "none"
+        return jsonify(data)
+
     data = public_user_dict(db, row)
+    data["created_at"] = row["created_at"]
+    data["profile_picture_url"] = profile_picture_url_for(row["id"], row["profile_picture_path"])
+    data["restricted"] = False
+
     data["total_pushups"] = row["total_pushups"]
     data["longest_streak"] = row["longest_streak"]
+
+    rpg_row = db.execute("SELECT * FROM rpg_players WHERE user_id = ?", (row["id"],)).fetchone()
+    if rpg_row is not None:
+        realms_completed = db.execute(
+            "SELECT COUNT(*) c FROM player_realm_progress WHERE user_id = ? AND status = 'completed'", (row["id"],)
+        ).fetchone()["c"]
+        emberfall_row = db.execute(
+            "SELECT progress_value, status FROM player_realm_progress WHERE user_id = ? AND realm_code = 'emberfall'",
+            (row["id"],),
+        ).fetchone()
+        emberfall_progress_value = emberfall_row["progress_value"] if emberfall_row else 0
+        data["rpg"] = {
+            "rpg_level": get_rpg_level_from_xp(rpg_row["rpg_xp"]),
+            "rpg_rank": get_rpg_rank_from_level(get_rpg_level_from_xp(rpg_row["rpg_xp"])),
+            "current_realm": "emberfall",
+            "current_realm_status": emberfall_row["status"] if emberfall_row else "active",
+            "emberfall_progress_value": emberfall_progress_value,
+            "emberfall_progress_total": EMBERFALL_TOTAL_REPS,
+            "current_armor": get_chest_armor_tier(emberfall_progress_value)["name"],
+            "current_shield": get_shield_tier(emberfall_progress_value)["name"],
+            "realms_completed": realms_completed,
+            "realms_total": len(REALM_DEFS),
+            "equipment": get_player_equipment(db, row["id"]),
+        }
+    else:
+        data["rpg"] = None
+
+    # Match history itself is a separate, existing privacy setting
+    # (match_history_visibility) — untouched here; this route has
+    # never exposed a match list, only aggregate stats, so nothing
+    # about that setting needed to change.
 
     all_ach = db.execute("SELECT * FROM achievements ORDER BY id").fetchall()
     unlocked = {
@@ -1832,10 +2805,12 @@ def public_profile(username):
         {"code": a["code"], "name": a["name"], "icon": a["icon"], "unlocked": a["id"] in unlocked}
         for a in all_ach
     ]
+    data["achievement_count"] = len(unlocked)
+    data["achievement_total"] = len(all_ach)
 
-    if row["id"] == my_id:
+    if is_self:
         data["relationship"] = "self"
-    elif are_friends(db, my_id, row["id"]):
+    elif is_friend:
         data["relationship"] = "friends"
     else:
         outgoing = db.execute(
@@ -2310,8 +3285,8 @@ def heartbeat():
 # ---------------------------------------------------------------------------
 # Routes — API — RPG (V1.5)
 # ---------------------------------------------------------------------------
-def rpg_player_to_dict(row):
-    return {
+def rpg_player_to_dict(row, db=None, user_id=None):
+    d = {
         "rpg_xp": row["rpg_xp"],
         "rpg_level": get_rpg_level_from_xp(row["rpg_xp"]),
         "rpg_rank": get_rpg_rank_from_level(get_rpg_level_from_xp(row["rpg_xp"])),
@@ -2321,6 +3296,22 @@ def rpg_player_to_dict(row):
         "total_damage": row["total_damage"],
         "monsters_defeated": row["monsters_defeated"],
     }
+    if db is not None and user_id is not None:
+        equipment = get_player_equipment(db, user_id)
+        emberfall = get_or_create_emberfall_progress(db, user_id)
+        realms_completed = db.execute(
+            "SELECT COUNT(*) c FROM player_realm_progress WHERE user_id = ? AND status = 'completed'", (user_id,)
+        ).fetchone()["c"]
+        d["current_realm"] = "emberfall"
+        d["current_realm_status"] = emberfall["status"]
+        d["emberfall_progress_value"] = emberfall["progress_value"]
+        d["emberfall_progress_total"] = EMBERFALL_TOTAL_REPS
+        d["current_armor"] = get_chest_armor_tier(emberfall["progress_value"])["name"]
+        d["current_shield"] = get_shield_tier(emberfall["progress_value"])["name"]
+        d["realms_completed"] = realms_completed
+        d["realms_total"] = len(REALM_DEFS)
+        d["equipment"] = equipment
+    return d
 
 
 @app.route("/api/rpg/profile")
@@ -2328,7 +3319,180 @@ def rpg_player_to_dict(row):
 def rpg_profile():
     db = get_db()
     player = get_or_create_rpg_player(db, session["user_id"])
-    return jsonify(rpg_player_to_dict(player))
+    return jsonify(rpg_player_to_dict(player, db, session["user_id"]))
+
+
+@app.route("/api/rpg/world")
+@login_required
+def rpg_world():
+    """The five-realm map. Locked realms are marked `playable: false` from
+    static REALM_DEFS — this is a fact about what's been built, never
+    derived from player state, so there's no path that could ever unlock
+    one client-side."""
+    db = get_db()
+    user_id = session["user_id"]
+    rows = db.execute("SELECT * FROM realms ORDER BY order_index").fetchall()
+    progress_rows = db.execute(
+        "SELECT realm_code, status FROM player_realm_progress WHERE user_id = ?", (user_id,)
+    ).fetchall()
+    progress = {r["realm_code"]: r["status"] for r in progress_rows}
+    realms = []
+    for r in rows:
+        status = progress.get(r["code"], "locked" if not r["playable"] else "not_started")
+        realms.append({
+            "code": r["code"], "display_name": r["display_name"], "subtitle": r["subtitle"],
+            "exercise_type": r["exercise_type"],
+            "theme": r["theme"], "order_index": r["order_index"], "playable": bool(r["playable"]),
+            "equipment_slot": r["equipment_slot"], "reward_name": r["reward_name"], "status": status,
+        })
+    return jsonify(realms=realms)
+
+
+# ---------------------------------------------------------------------------
+# V1.11 — RPG QA mode (dev/test-only). Entirely absent as a usable endpoint
+# unless RPG_QA_MODE=true is explicitly set — returns 404 otherwise, same
+# as if the route didn't exist, so there is nothing to discover/probe for
+# in production. Lets a logged-in test account set their OWN Emberfall
+# progress directly and read back every server-computed field, instead of
+# physically performing thousands of reps to test a boundary.
+@app.route("/api/rpg/qa/set-progress", methods=["POST"])
+@login_required
+def rpg_qa_set_progress():
+    if not RPG_QA_MODE:
+        return jsonify(error="not found"), 404
+    body = request.json or {}
+    reps = body.get("reps")
+    if not isinstance(reps, int) or isinstance(reps, bool) or reps < 0:
+        return jsonify(error="reps must be a non-negative integer"), 400
+
+    db = get_db()
+    user_id = session["user_id"]
+    get_or_create_emberfall_progress(db, user_id)  # ensure a row exists
+    db.execute(
+        "UPDATE player_realm_progress SET progress_value = ?, status = ? WHERE user_id = ? AND realm_code = 'emberfall'",
+        (reps, "completed" if reps >= EMBERFALL_TOTAL_REPS else "active", user_id),
+    )
+    # QA-set values also drive chest/shield equipment + achievements the
+    # SAME way real progress does — reusing the same tier tables directly
+    # (with a 0-rep delta so it only evaluates the CURRENT tier's grants,
+    # doesn't double-apply combat XP/gold).
+    armor_tier = get_chest_armor_tier(reps)
+    shield = get_shield_tier(reps)
+    if armor_tier["code"] is not None:  # 0-999 reps has NO chest armor to grant — nothing to equip
+        grant_equipment(db, user_id, "chest", armor_tier["name"], "emberfall")
+    grant_equipment(db, user_id, "shield", shield["name"], "emberfall")
+    if reps >= 1000:
+        unlock_achievement(db, user_id, "ASHEN_SURVIVOR")
+    if reps >= 5000:
+        unlock_achievement(db, user_id, "MIDPOINT_WARRIOR")
+    if reps >= EMBERFALL_BOSS_UNLOCK_REPS:
+        unlock_achievement(db, user_id, "OBSIDIAN_BOUND")
+    if reps >= EMBERFALL_TOTAL_REPS:
+        unlock_achievement(db, user_id, "EMBERFALL_RECLAIMED")
+    db.commit()
+
+    return jsonify(rpg_qa_state(db, user_id))
+
+
+@app.route("/api/rpg/qa/state")
+@login_required
+def rpg_qa_state_route():
+    if not RPG_QA_MODE:
+        return jsonify(error="not found"), 404
+    db = get_db()
+    return jsonify(rpg_qa_state(db, session["user_id"]))
+
+
+def rpg_qa_state(db, user_id):
+    """The exact fields the QA spec asks to expose, all server-computed —
+    same source of truth as the real profile/realm endpoints, not a
+    parallel calculation."""
+    progress = get_or_create_emberfall_progress(db, user_id)
+    reps = progress["progress_value"]
+    location = emberfall_milestone_for(reps)
+    armor_tier = get_chest_armor_tier(reps)
+    shield = get_shield_tier(reps)
+    rpg_row = get_or_create_rpg_player(db, user_id)
+    boss_unlocked = reps >= EMBERFALL_BOSS_UNLOCK_REPS
+    return {
+        "emberfall_reps": reps,
+        "current_location": location["location_name"],
+        "current_armor": armor_tier["name"],
+        "current_shield": shield["name"],
+        "rpg_level": get_rpg_level_from_xp(rpg_row["rpg_xp"]),
+        "realm_status": progress["status"],
+        "boss_unlocked": boss_unlocked,
+        "progress_pct": round(100 * min(reps, EMBERFALL_TOTAL_REPS) / EMBERFALL_TOTAL_REPS),
+    }
+
+
+@app.route("/api/rpg/realm/<code>")
+@login_required
+def rpg_realm_detail(code):
+    db = get_db()
+    user_id = session["user_id"]
+    realm = db.execute("SELECT * FROM realms WHERE code = ?", (code,)).fetchone()
+    if realm is None:
+        return jsonify(error="realm not found"), 404
+    if not realm["playable"]:
+        return jsonify(
+            code=realm["code"], display_name=realm["display_name"], subtitle=realm["subtitle"],
+            exercise_type=realm["exercise_type"],
+            theme=realm["theme"], playable=False, status="locked",
+        )
+    progress = get_or_create_emberfall_progress(db, user_id)
+    progress_value = progress["progress_value"]
+    current_location = emberfall_milestone_for(progress_value)
+    current_armor_tier = get_chest_armor_tier(progress_value)
+    monsters = db.execute(
+        "SELECT * FROM monsters WHERE active = 1 AND realm_code = ? ORDER BY difficulty", (code,)
+    ).fetchall()
+
+    # V1.8: location status now derives from the 10,000-rep milestone table
+    # (cumulative validated reps), NOT "has this specific monster ever been
+    # defeated" — matches the spec's progression ranges, where a player
+    # passes through a location by accumulating reps across many
+    # encounters (any monster, any order — /encounters/start is unchanged).
+    locations = []
+    for lo, hi, location_name, monster_theme in EMBERFALL_MILESTONES:
+        m = next((row for row in monsters if (row["theme_name"] or row["name"]) == monster_theme), None)
+        if progress_value > hi or progress["status"] == "completed":
+            loc_status = "completed"
+        elif lo <= progress_value <= hi:
+            loc_status = "current"
+        else:
+            loc_status = "upcoming"
+        # V1.12: armor no longer shares this table's boundaries — shown
+        # per-location as "the armor tier active once you reach here"
+        # (evaluated at this location's own starting rep count).
+        location_armor_name = get_chest_armor_tier(lo)["name"]
+        locations.append({
+            "monster_id": m["id"] if m else None,
+            "location_name": location_name, "monster_theme_name": monster_theme,
+            "icon": m["icon"] if m else "", "is_boss": bool(m["is_boss"]) if m else False,
+            "status": loc_status, "reps_min": lo, "reps_max": hi, "armor_name": location_armor_name,
+        })
+    progress_pct = round(100 * min(progress_value, EMBERFALL_TOTAL_REPS) / EMBERFALL_TOTAL_REPS)
+
+    return jsonify(
+        code=realm["code"], display_name=realm["display_name"], subtitle=realm["subtitle"],
+        exercise_type=realm["exercise_type"],
+        theme=realm["theme"], playable=True, status=progress["status"], progress_pct=progress_pct,
+        progress_value=progress_value, progress_total=EMBERFALL_TOTAL_REPS,
+        current_armor=current_armor_tier["name"], current_location=current_location["location_name"],
+        boss_unlocked=(progress_value >= EMBERFALL_BOSS_UNLOCK_REPS),
+        reward_name=realm["reward_name"], equipment_slot=realm["equipment_slot"],
+        locations=locations,
+        monsters=[
+            {
+                "id": m["id"], "name": m["name"], "theme_name": m["theme_name"] or m["name"],
+                "description": m["description"], "max_hp": m["max_hp"], "difficulty": m["difficulty"],
+                "xp_reward": m["xp_reward"], "gold_reward": m["gold_reward"], "icon": m["icon"],
+                "is_boss": bool(m["is_boss"]),
+            }
+            for m in monsters
+        ],
+    )
 
 
 @app.route("/api/rpg/monsters")
@@ -2338,9 +3502,11 @@ def list_monsters():
     rows = db.execute("SELECT * FROM monsters WHERE active = 1 ORDER BY difficulty").fetchall()
     return jsonify([
         {
-            "id": r["id"], "name": r["name"], "description": r["description"],
+            "id": r["id"], "name": r["name"], "theme_name": r["theme_name"] or r["name"],
+            "description": r["description"],
             "max_hp": r["max_hp"], "difficulty": r["difficulty"],
             "xp_reward": r["xp_reward"], "gold_reward": r["gold_reward"], "icon": r["icon"],
+            "is_boss": bool(r["is_boss"]), "realm_code": r["realm_code"],
         }
         for r in rows
     ])
@@ -2362,7 +3528,9 @@ def rpg_encounter_current():
     monster = db.execute("SELECT * FROM monsters WHERE id = ?", (enc["monster_id"],)).fetchone()
     return jsonify(
         active=True, encounter_id=enc["id"], monster_hp=enc["monster_hp"],
-        monster_max_hp=monster["max_hp"], monster_name=monster["name"], monster_icon=monster["icon"],
+        monster_max_hp=monster["max_hp"], monster_name=monster["name"],
+        monster_theme_name=monster["theme_name"] or monster["name"], monster_icon=monster["icon"],
+        monster_difficulty=monster["difficulty"], monster_is_boss=bool(monster["is_boss"]),
         started_at=enc["started_at"], expires_at=enc["expires_at"],
     )
 
@@ -2404,6 +3572,18 @@ def start_encounter():
     monster = db.execute("SELECT * FROM monsters WHERE id = ? AND active = 1", (monster_id,)).fetchone()
     if monster is None:
         return jsonify(error="monster not found"), 404
+
+    # V1.8: the Emberfall boss only becomes challengeable once the player
+    # has actually reclaimed enough of Emberfall — a soft, honest gate
+    # (clear error message), not a silent block. Every other monster is
+    # still freely choosable in any order, exactly as before.
+    if monster["is_boss"] and monster["realm_code"] == "emberfall":
+        progress = get_or_create_emberfall_progress(db, user_id)
+        if progress["progress_value"] < EMBERFALL_BOSS_UNLOCK_REPS:
+            return jsonify(
+                error=f"Reach {EMBERFALL_BOSS_UNLOCK_REPS:,} reclaimed reps to challenge the Ashen Guardian "
+                      f"(currently {progress['progress_value']:,})"
+            ), 403
 
     get_or_create_rpg_player(db, user_id)
     now = time.time()
@@ -2495,6 +3675,8 @@ def submit_hit(encounter_id):
     if enc["status"] != "active":
         return jsonify(error="encounter is not active"), 409
 
+    monster = db.execute("SELECT * FROM monsters WHERE id = ?", (enc["monster_id"],)).fetchone()
+
     damage = reps * RPG_BASE_DAMAGE_PER_REP
     new_hp = max(0, enc["monster_hp"] - damage)
 
@@ -2530,10 +3712,96 @@ def submit_hit(encounter_id):
 
     result = {"monster_hp": new_hp, "damage_dealt": damage, "defeated": False}
 
+    # --- V1.8: Emberfall's cumulative 10,000-rep progression ---------------
+    # Only accumulates for monsters actually in Emberfall (the only realm
+    # with combat today) — uses the SAME `reps` value the server just
+    # validated and applied as combat damage above, not a new/separate
+    # trusted number. Runs on every accepted hit, not just monster defeats,
+    # since armor can evolve mid-encounter.
+    if monster["realm_code"] == "emberfall":
+        progress_upgrade = _apply_emberfall_progress(db, user_id, reps)
+        if progress_upgrade:
+            result["emberfall_progress"] = progress_upgrade
+
     if new_hp <= 0:
         result["defeated"] = _finalize_encounter_victory(db, encounter_id, user_id)
 
     return jsonify(result)
+
+
+def _apply_emberfall_progress(db, user_id, reps):
+    """Adds `reps` to the player's cumulative Emberfall progress, updates
+    their chest-armor tier if they crossed into a new milestone, and marks
+    the realm completed at 10,000. Returns info about what changed (armor
+    upgrade / realm completion) for the frontend to show AFTER the current
+    battle, or None if nothing crossed a threshold this hit."""
+    progress = get_or_create_emberfall_progress(db, user_id)
+    old_value = progress["progress_value"]
+    new_value = old_value + reps  # not clamped in storage — clamped only at display/lookup time
+    db.execute(
+        "UPDATE player_realm_progress SET progress_value = ? WHERE user_id = ? AND realm_code = 'emberfall'",
+        (new_value, user_id),
+    )
+
+    old_armor = get_chest_armor_tier(old_value)
+    new_armor = get_chest_armor_tier(new_value)
+    old_shield = get_shield_tier(old_value)
+    new_shield = get_shield_tier(new_value)
+    info = {}
+
+    # "Ashen Survivor" — completing the Ashen Gate encounter means passing
+    # its milestone boundary (1000 reps.) unlock_achievement() is
+    # idempotent (UNIQUE constraint), so this is safe even if somehow
+    # re-evaluated for the same crossing.
+    if old_value < 1000 <= new_value:
+        unlock_achievement(db, user_id, "ASHEN_SURVIVOR")
+    if old_value < 5000 <= new_value:
+        unlock_achievement(db, user_id, "MIDPOINT_WARRIOR")
+    if old_value < EMBERFALL_BOSS_UNLOCK_REPS <= new_value:
+        unlock_achievement(db, user_id, "OBSIDIAN_BOUND")
+
+    # V1.12: chest armor is its own tier axis (CHEST_ARMOR_TIERS), no
+    # longer read off the location table. 0-999 reps has code=None (no
+    # chest armor at all) — nothing is granted/announced while both old
+    # and new tiers are that same "no armor" state; the very first grant
+    # fires the moment the player crosses into 1000 reps (None -> "Worn
+    # Emberplate"), which correctly reads as an upgrade from nothing.
+    if new_armor["code"] != old_armor["code"]:
+        if new_armor["code"] is not None:
+            grant_equipment(db, user_id, "chest", new_armor["name"], "emberfall")
+            info["armor_upgraded"] = {
+                "armor_name": new_armor["name"],
+                "reps_reclaimed": new_armor["min"],
+            }
+        # (new_armor["code"] is None only when moving DOWN in reps, which
+        # can't happen — reps only ever increase — kept as a guard anyway.)
+
+    # Shield tier — same milestone-crossing pattern as chest armor, reusing
+    # the SAME player_equipment table/architecture with slot='shield'
+    # rather than a parallel system (per spec: integrate into the existing
+    # equipped-item architecture).
+    if new_shield["code"] != old_shield["code"]:
+        grant_equipment(db, user_id, "shield", new_shield["name"], "emberfall")
+        info["shield_upgraded"] = {
+            "shield_name": new_shield["name"], "reps_reclaimed": new_shield["min"],
+        }
+
+    if new_value >= EMBERFALL_TOTAL_REPS and progress["status"] != "completed":
+        unlock_achievement(db, user_id, "EMBERFALL_RECLAIMED")
+        claimed = db.execute(
+            "UPDATE player_realm_progress SET status = 'completed', completed_at = ? "
+            "WHERE user_id = ? AND realm_code = 'emberfall' AND status != 'completed'",
+            (time.time(), user_id),
+        )
+        if claimed.rowcount > 0:
+            realm = db.execute("SELECT * FROM realms WHERE code = 'emberfall'").fetchone()
+            info["realm_completed"] = {
+                "realm_code": "emberfall", "realm_display_name": realm["display_name"],
+                "reward_name": "Legendary Emberplate", "equipment_slot": "chest",
+            }
+
+    db.commit()
+    return info or None
 
 
 def _finalize_encounter_victory(db, encounter_id, user_id):
@@ -2566,10 +3834,13 @@ def _finalize_encounter_victory(db, encounter_id, user_id):
     level_after = get_rpg_level_from_xp(player_after["rpg_xp"])
     check_and_unlock_rpg_achievements(db, user_id, monster["name"], player_after["monsters_defeated"], level_after)
     db.commit()
-    return {
-        "monster_name": monster["name"], "xp_reward": monster["xp_reward"], "gold_reward": monster["gold_reward"],
+
+    result = {
+        "monster_name": monster["name"], "monster_theme_name": monster["theme_name"] or monster["name"],
+        "xp_reward": monster["xp_reward"], "gold_reward": monster["gold_reward"],
         "leveled_up": level_after > level_before, "new_rpg_level": level_after,
     }
+    return result
 
 
 def check_and_unlock_rpg_achievements(db, user_id, monster_name, monsters_defeated, rpg_level):
@@ -2750,6 +4021,48 @@ def get_or_create_rpg_player(db, user_id):
     return db.execute("SELECT * FROM rpg_players WHERE user_id = ?", (user_id,)).fetchone()
 
 
+def get_or_create_emberfall_progress(db, user_id):
+    """Every player — existing or new — defaults into Emberfall as their
+    active realm the first time this is called, exactly per spec (§17:
+    'current realm = EMBERFALL unless existing progression indicates
+    otherwise'). No other realm can ever get a row here in V1."""
+    row = db.execute(
+        "SELECT * FROM player_realm_progress WHERE user_id = ? AND realm_code = 'emberfall'", (user_id,)
+    ).fetchone()
+    if row is not None:
+        return row
+    db.execute(
+        "INSERT INTO player_realm_progress (user_id, realm_code, status, started_at) VALUES (?, 'emberfall', 'active', ?)",
+        (user_id, time.time()),
+    )
+    db.commit()
+    return db.execute(
+        "SELECT * FROM player_realm_progress WHERE user_id = ? AND realm_code = 'emberfall'", (user_id,)
+    ).fetchone()
+
+
+def grant_equipment(db, user_id, slot, item_name, realm_code):
+    """Upserts a slot's item — V1.8's armor EVOLVES through tiers (Worn ->
+    ... -> Legendary), so this must overwrite an existing slot, not just
+    insert-once. (V1.7 originally treated equipment as a single one-time
+    reward and only inserted; that no longer matches how Emberfall's
+    armor actually progresses.)"""
+    db.execute(
+        """INSERT INTO player_equipment (user_id, slot, item_name, realm_code, acquired_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, slot) DO UPDATE SET
+             item_name = excluded.item_name, realm_code = excluded.realm_code, acquired_at = excluded.acquired_at""",
+        (user_id, slot, item_name, realm_code, time.time()),
+    )
+    db.commit()
+    return True
+
+
+def get_player_equipment(db, user_id):
+    rows = db.execute("SELECT slot, item_name, realm_code FROM player_equipment WHERE user_id = ?", (user_id,)).fetchall()
+    return {r["slot"]: {"item_name": r["item_name"], "realm_code": r["realm_code"]} for r in rows}
+
+
 def award_rpg_reward(db, user_id, transaction_type, amount, reason, reference_id):
     """RPG equivalent of award_xp() — SAME idempotency pattern (unique
     constraint on the transaction row). transaction_type is 'rpg_xp' or
@@ -2810,28 +4123,44 @@ def check_and_unlock_achievements(db, user_id, is_new_personal_best, match_id=No
         try_unlock("FIRST_MATCH")
     if u["total_pushups"] >= 1:
         try_unlock("FIRST_REP")
+    if u["total_pushups"] >= 25:
+        try_unlock("WARM_UP")
+    if u["total_pushups"] >= 50:
+        try_unlock("GETTING_STRONGER")
     if u["wins"] >= 1:
         try_unlock("FIRST_WIN")
     if total_matches >= 10:
         try_unlock("TEN_MATCHES")
     if u["total_pushups"] >= 100:
         try_unlock("HUNDRED_PUSHUPS")
+    if u["wins"] >= 5:
+        try_unlock("CHALLENGER")
     if u["wins"] >= 10:
         try_unlock("TEN_WINS")
     if u["current_streak"] >= 5:
         try_unlock("FIVE_WIN_STREAK")
     if u["current_streak"] >= 10:
         try_unlock("TEN_WIN_STREAK")
-    if u["elo"] >= 1200:
+    # Fixed from >=1200 to >=1000 to match the new Silver tier's actual
+    # threshold (V1.9 rank-tier update) — the achievement's description
+    # names "Silver" explicitly, so it needs to track wherever Silver
+    # actually starts under the current table, not the old one.
+    if u["elo"] >= 1000:
         try_unlock("REACH_SILVER")
     if u["elo"] >= 1500:
         try_unlock("REACH_1500")
+    if u["elo"] >= 1600:
+        try_unlock("REACH_DIAMOND")
     if u["elo"] >= 1800:
         try_unlock("REACH_1800")
     if u["elo"] >= 2000:
         try_unlock("REACH_2000")
+    if u["elo"] >= 2400:
+        try_unlock("REACH_LEGEND")
     if is_new_personal_best:
         try_unlock("PERSONAL_BEST")
+    if u["best_pushups"] >= 20:
+        try_unlock("TWENTY_STRONG")
     if u["total_pushups"] >= 1000:
         try_unlock("THOUSAND_PUSHUPS")
     if u["total_pushups"] >= 5000:
@@ -2880,6 +4209,19 @@ def get_match_progression_for_user(db, match_id, user_id):
     }
 
 
+def profile_picture_url_for(user_id, picture_path):
+    """Builds the picture URL with a cache-busting version query derived
+    from the stored filename itself (a fresh uuid4 on every upload, so it
+    changes precisely when the picture changes — no extra DB column or
+    Date.now()-style client hack needed, and it stays correct even for
+    OTHER users' pictures fetched fresh from the server, e.g. an opponent's
+    picture in a match). None on removal, since there's nothing to serve."""
+    if not picture_path:
+        return None
+    version = os.path.splitext(picture_path)[0][:12]
+    return f"/api/profile/picture/{user_id}?v={version}"
+
+
 def user_to_dict(row):
     return {
         "id": row["id"],
@@ -2894,6 +4236,12 @@ def user_to_dict(row):
         "level": get_level_from_xp(row["xp"]),
         "rank_tier": get_rank_from_elo(row["elo"]),
         "avatar_id": row["avatar_id"],
+        # Frontend falls back to the emoji avatar on load error (e.g. a
+        # friends-only picture between non-friends 403s) rather than this
+        # endpoint trying to pre-compute visibility for every caller.
+        "profile_picture_url": profile_picture_url_for(row["id"], row["profile_picture_path"]),
+        "has_seen_pushup_how_it_works": bool(row["has_seen_pushup_how_it_works"]),
+        "has_seen_rpg_how_it_works": bool(row["has_seen_rpg_how_it_works"]),
     }
 
 

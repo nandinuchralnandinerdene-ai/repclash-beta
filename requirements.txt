@@ -1,3 +1,6 @@
 Flask==3.0.3
 Flask-Limiter==3.8.0
 gunicorn
+requests==2.32.3
+Pillow==12.3.0
+google-auth==2.35.0

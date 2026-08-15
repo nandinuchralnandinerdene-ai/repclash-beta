@@ -1,5 +1,5 @@
 // =============================================================================
-// REPCLASH — client
+// VISOREP — client
 // V1.2: proper Ready state machine (WAITING -> READY -> IN_PROGRESS ->
 // COMPLETED), server-synchronized countdown/timer, rematch flow. All V1.1
 // protections (CSRF header, resume-after-refresh, stricter AI detection,
@@ -9,11 +9,11 @@
 const CONFIG = {
   DOWN_ANGLE: 90,
   UP_ANGLE: 160,
-  MIN_SHOULDER_MOVEMENT_RATIO: 0.035,
+  MIN_SHOULDER_MOVEMENT_RATIO: 0.025, // V1.16: was 0.035 — see note on MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO below (this is only the frame-relative fallback, rarely the active path)
   MIN_REP_INTERVAL_MS: 500,
   MIN_LANDMARK_VISIBILITY: 0.5,
   MIN_BODY_VISIBILITY: 0.35,
-  MAX_HIP_SAG_DEVIATION: 35,
+  MAX_HIP_DEVIATION_RATIO: 0.13, // hip's perpendicular distance from the shoulder-ankle line, as a fraction of body length — see computeHipAlignment()
   MANUAL_TAP_COOLDOWN_MS: 500,
   MAX_PUSHUPS_60S: 150,
   FEEDBACK_MIN_DISPLAY_MS: 800,
@@ -43,7 +43,32 @@ const CONFIG = {
   // vertically for a rep to count. Normalizing by body scale means the
   // same real-world movement counts consistently whether the camera is
   // close or far — untested against a real camera, expect to tune.
-  MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO: 0.18,
+  // V1.16 calibration fix: the ROOT CAUSE of valid reps being rejected
+  // after the landmark-stability pass was traced (not guessed) to how
+  // shoulder movement was measured — see downShoulderYExtreme in
+  // detectionLoop/rpgDetectionLoop. It used to compare two single
+  // instantaneous samples taken exactly at the down/up transition
+  // instants; EMA smoothing (needed for landmark stability) attenuates
+  // the amplitude of a signal sampled that way, so genuine movement could
+  // be undercounted. Fixed at the SOURCE by tracking the actual peak
+  // displacement reached at any point during the down phase instead of
+  // two boundary samples — that fix alone recovers most of the lost
+  // signal. This threshold is ALSO modestly relaxed (was 0.18) as a
+  // safety margin for the smoothing that necessarily still exists even in
+  // the peak value. Reasoned from the tracking pipeline's behavior, not
+  // yet validated against real camera footage — expect to tune further
+  // once real push-ups are actually tested.
+  MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO: 0.13,
+
+  // --- V1.15: landmark side-lock + temporal stability (root-cause fix for
+  // the shoulder/elbow/wrist "jumping between joints / switching sides"
+  // problem — see poseTracker* below) ---
+  POSE_SIDE_SWITCH_CONFIRM_FRAMES: 8, // the OTHER side must be clearly better for this many CONSECUTIVE frames before we switch
+  POSE_SIDE_SWITCH_MARGIN: 0.20,      // "clearly better" = otherVis - lockedVis exceeds this, on the same 0-3 visibility-sum scale as leftVis/rightVis
+  LANDMARK_SMOOTHING_ALPHA: 0.35,     // EMA weight on the new raw sample; higher = more responsive, lower = smoother/laggier
+  MAX_LANDMARK_JUMP: 0.12,            // normalized-coordinate cap on one frame's displacement for shoulder/elbow/wrist before we hold the previous point instead
+  ANATOMY_RATIO_TOLERANCE: 0.45,      // max fractional change (this frame vs person's own recent running-average) allowed in shoulder-elbow / elbow-wrist distance before the frame is treated as noisy
+  UNSTABLE_TRACKING_FRAMES: 15,       // consecutive noisy/held frames before we surface "AI is re-locking your arm" instead of silently guessing
 };
 
 const API = "/api";
@@ -130,6 +155,26 @@ async function api(path, options = {}) {
   return data;
 }
 
+// Camera-active indicator: a visible "🔴 CAMERA ACTIVE" pill shown ONLY
+// while a given camera stream is genuinely live, toggled right alongside
+// the actual getUserMedia()/getTracks().stop() calls below — never on
+// login/signup/home/profile/notifications, since nothing there ever
+// touches the camera in the first place.
+// SECURITY: usernames are user-controlled and rendered via innerHTML in
+// several list views (leaderboards, friend lists/requests, notifications).
+// Escape before interpolating — the alternative is stored XSS via a
+// malicious username (e.g. signing up as `<img src=x onerror=...>`).
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str == null ? "" : String(str);
+  return div.innerHTML;
+}
+
+function setCameraActiveIndicator(elementId, active) {
+  const el = document.getElementById(elementId);
+  if (el) el.classList.toggle("hidden", !active);
+}
+
 let connectionBannerTimeout = null;
 function showConnectionBanner() {
   const el = document.getElementById("connectionBanner");
@@ -158,14 +203,103 @@ function updateUserBadge() {
 
 // ---------------------------------------------------------------- bootstrap
 (async function bootstrap() {
+  // Reveal the Google buttons only if the server actually has OAuth
+  // configured — otherwise clicking them would just 503.
+  try {
+    const g = await api("/auth/google/status");
+    if (g.available) {
+      document.getElementById("googleLoginBtn").classList.remove("hidden");
+      document.getElementById("googleSignupBtn").classList.remove("hidden");
+    }
+  } catch (e) { /* non-critical */ }
+
+  // A password-reset email link lands here as /?reset_token=... — pick it
+  // up, show the reset form, then scrub the token out of the visible URL.
+  const params = new URLSearchParams(window.location.search);
+  const resetToken = params.get("reset_token");
+  if (params.get("google_login") === "success") {
+    history.replaceState({}, "", window.location.pathname);
+  } else if (params.get("google_error")) {
+    showNotice(`⚠️ Google sign-in failed (${params.get("google_error")})`);
+    history.replaceState({}, "", window.location.pathname);
+  }
+
   try {
     me = await api("/me");
     updateUserBadge();
     await resumeActiveMatchIfAny();
   } catch (e) {
     showScreen("login");
+    if (resetToken) {
+      showAuthForm("reset");
+      document.getElementById("resetPasswordForm").dataset.token = resetToken;
+      history.replaceState({}, "", window.location.pathname);
+    }
   }
 })();
+
+// ---------------------------------------------------------------- auth sub-forms
+// loginForm / signupForm / forgotPasswordForm / resetPasswordForm are all
+// panels within loginScreen — this toggles which one is visible, separately
+// from showScreen() (which operates at the whole-screen level).
+function showAuthForm(which) {
+  const forms = { login: "loginForm", signup: "signupForm", forgot: "forgotPasswordForm", reset: "resetPasswordForm" };
+  Object.values(forms).forEach(id => document.getElementById(id).classList.add("hidden"));
+  document.getElementById(forms[which]).classList.remove("hidden");
+  document.getElementById("tabLoginBtn").classList.toggle("active", which === "login");
+  document.getElementById("tabSignupBtn").classList.toggle("active", which === "signup");
+}
+
+document.getElementById("forgotPasswordLinkBtn").addEventListener("click", () => showAuthForm("forgot"));
+document.getElementById("forgotPasswordBackBtn").addEventListener("click", () => showAuthForm("login"));
+
+document.getElementById("forgotPasswordSubmitBtn").addEventListener("click", async () => {
+  const email = document.getElementById("forgotPasswordEmailInput").value.trim();
+  const msgEl = document.getElementById("forgotPasswordMsg");
+  const errEl = document.getElementById("forgotPasswordError");
+  msgEl.textContent = ""; errEl.textContent = "";
+  if (!email) { errEl.textContent = "Please enter your email"; return; }
+  try {
+    const r = await api("/auth/forgot-password", { method: "POST", body: JSON.stringify({ email }) });
+    // Dev-mode fallback (no SMTP configured on the server) hands back the
+    // link directly instead of pretending an email went out — surface that
+    // honestly rather than hiding it.
+    msgEl.textContent = r.reset_link
+      ? `DEV MODE (no email provider configured): ${r.reset_link}`
+      : r.status;
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
+});
+
+document.getElementById("resetPasswordSubmitBtn").addEventListener("click", async () => {
+  const form = document.getElementById("resetPasswordForm");
+  const token = form.dataset.token;
+  const password = document.getElementById("resetPasswordInput").value;
+  const msgEl = document.getElementById("resetPasswordMsg");
+  const errEl = document.getElementById("resetPasswordError");
+  msgEl.textContent = ""; errEl.textContent = "";
+  if (!token) { errEl.textContent = "Reset link is invalid — please request a new one"; return; }
+  if (!password) { errEl.textContent = "Please enter a new password"; return; }
+  try {
+    await api("/auth/reset-password", { method: "POST", body: JSON.stringify({ token, password }) });
+    msgEl.textContent = "Password reset — you can log in now.";
+    setTimeout(() => showAuthForm("login"), 1500);
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
+});
+
+document.getElementById("googleLoginBtn").addEventListener("click", () => {
+  window.location.href = API + "/auth/google/login";
+});
+document.getElementById("googleSignupBtn").addEventListener("click", () => {
+  window.location.href = API + "/auth/google/login";
+});
+
+// ---------------------------------------------------------------- auth tabs
+document.getElementById("tabLoginBtn").addEventListener("click", () => showAuthForm("login"));
+document.getElementById("tabSignupBtn").addEventListener("click", () => showAuthForm("signup"));
 
 async function resumeActiveMatchIfAny() {
   try {
@@ -224,20 +358,7 @@ async function resumeActiveMatchIfAny() {
   }
 }
 
-// ---------------------------------------------------------------- auth tabs
-document.getElementById("tabLoginBtn").addEventListener("click", () => {
-  document.getElementById("tabLoginBtn").classList.add("active");
-  document.getElementById("tabSignupBtn").classList.remove("active");
-  document.getElementById("loginForm").classList.remove("hidden");
-  document.getElementById("signupForm").classList.add("hidden");
-});
 
-document.getElementById("tabSignupBtn").addEventListener("click", () => {
-  document.getElementById("tabSignupBtn").classList.add("active");
-  document.getElementById("tabLoginBtn").classList.remove("active");
-  document.getElementById("signupForm").classList.remove("hidden");
-  document.getElementById("loginForm").classList.add("hidden");
-});
 
 // ---------------------------------------------------------------- login
 document.getElementById("loginBtn").addEventListener("click", async () => {
@@ -259,11 +380,12 @@ document.getElementById("loginBtn").addEventListener("click", async () => {
 document.getElementById("signupBtn").addEventListener("click", async () => {
   const username = document.getElementById("signupUsernameInput").value.trim();
   const password = document.getElementById("signupPasswordInput").value;
+  const email = document.getElementById("signupEmailInput").value.trim();
   const errEl = document.getElementById("signupError");
   errEl.textContent = "";
   if (!username || !password) { errEl.textContent = "Please enter your username and password"; return; }
   try {
-    me = await api("/signup", { method: "POST", body: JSON.stringify({ username, password }) });
+    me = await api("/signup", { method: "POST", body: JSON.stringify({ username, password, email: email || undefined }) });
     updateUserBadge();
     showScreen("lobby");
     loadLeaderboard();
@@ -416,6 +538,25 @@ function avatarEmoji(avatarId) {
   return AVATAR_EMOJIS[(avatarId || 1) - 1] || AVATAR_EMOJIS[0];
 }
 
+// Renders a profile picture if one is set, falling back to the emoji
+// avatar on load error (e.g. a friends-only picture the viewer can't see,
+// or no picture at all) — this is what lets match intro / battle bar show
+// real pictures without duplicating the friends-only check client-side.
+function renderAvatarInto(imgElId, emojiElId, pictureUrl, avatarId) {
+  const img = document.getElementById(imgElId);
+  const emoji = document.getElementById(emojiElId);
+  if (pictureUrl) {
+    img.onerror = () => { img.classList.add("hidden"); emoji.classList.remove("hidden"); };
+    img.src = pictureUrl;
+    img.classList.remove("hidden");
+    emoji.classList.add("hidden");
+  } else {
+    img.classList.add("hidden");
+    emoji.classList.remove("hidden");
+  }
+  emoji.textContent = avatarEmoji(avatarId);
+}
+
 async function loadProfile() {
   try {
     currentProfile = await api("/profile");
@@ -424,7 +565,7 @@ async function loadProfile() {
   }
   const p = currentProfile;
 
-  document.getElementById("profileAvatar").textContent = avatarEmoji(p.avatar_id);
+  renderAvatarInto("profileAvatarImg", "profileAvatarEmoji", p.profile_picture_url, p.avatar_id);
   document.getElementById("profileUsername").textContent = p.username;
   document.getElementById("profileRankBadge").textContent = `${p.rank_tier} · #${p.elo_rank}`;
   const countryEl = document.getElementById("profileCountry");
@@ -452,6 +593,35 @@ async function loadProfile() {
   document.getElementById("profileWinRate").textContent = p.win_rate + "%";
   document.getElementById("profileBest").textContent = p.best_pushups;
   document.getElementById("profileTotalPushups").textContent = p.total_pushups;
+
+  const rpgSection = document.getElementById("profileRpgSection");
+  if (p.rpg) {
+    rpgSection.classList.remove("hidden");
+    document.getElementById("profileRpgCharacterPortrait").innerHTML = renderEquippedCharacter(p.rpg, 120);
+    document.getElementById("profileRpgLevelRankText").textContent = `LEVEL ${p.rpg.rpg_level} · ${p.rpg.rpg_rank.toUpperCase()}`;
+    document.getElementById("profileRpgBadge").innerHTML = renderRankBadge(p.rpg.rpg_rank, 48);
+    document.getElementById("profileRpgLevel").textContent = p.rpg.rpg_level;
+    document.getElementById("profileRpgRank").textContent = p.rpg.rpg_rank;
+    document.getElementById("profileRpgRealms").textContent = `${p.rpg.realms_completed} / ${p.rpg.realms_total}`;
+    document.getElementById("profileRpgEmberfallReps").textContent =
+      `${p.rpg.emberfall_progress_value.toLocaleString()} / ${p.rpg.emberfall_progress_total.toLocaleString()} reps reclaimed`;
+    document.getElementById("profileRpgShieldLine").textContent = `🔰 ${p.rpg.current_shield}`;
+    const eqEl = document.getElementById("profileRpgEquipment");
+    eqEl.innerHTML = "";
+    Object.keys(EQUIPMENT_SLOT_ICONS).forEach(slot => {
+      const acquired = !!(p.rpg.equipment && p.rpg.equipment[slot]);
+      const itemName = acquired ? p.rpg.equipment[slot].item_name : null;
+      const chip = document.createElement("div");
+      chip.className = "equipmentChip" + (acquired ? " equipmentChipAcquired" : " equipmentChipLocked");
+      const iconHtml = slot === "chest" && acquired
+        ? renderEquipmentArt(itemName, true, 20)
+        : equipmentIconSvg(slot, acquired, 20);
+      chip.innerHTML = `<span class="equipmentChipIcon">${iconHtml}</span><span class="hint">${acquired ? escapeHtml(itemName) : EQUIPMENT_SLOT_LABELS[slot]}</span><span>${acquired ? "✓" : "🔒"}</span>`;
+      eqEl.appendChild(chip);
+    });
+  } else {
+    rpgSection.classList.add("hidden");
+  }
 
   renderAchievements(p.achievements, currentAchCategory);
 
@@ -503,8 +673,82 @@ document.getElementById("editProfileBtn").addEventListener("click", () => {
     picker.appendChild(btn);
   });
   picker.dataset.selected = selected;
+  document.getElementById("editEmailInput").value = currentProfile.email || "";
+  document.getElementById("editProfileVisibilitySelect").value = currentProfile.profile_visibility || "public";
+  renderProfilePicturePreview(currentProfile.profile_picture_url);
   document.getElementById("editProfileError").textContent = "";
+  document.getElementById("profilePictureError").textContent = "";
   document.getElementById("editProfileForm").classList.remove("hidden");
+});
+
+// ---------------------------------------------------------------- profile picture
+function renderProfilePicturePreview(url) {
+  const img = document.getElementById("profilePicturePreviewImg");
+  const emptyLabel = document.getElementById("profilePictureEmptyLabel");
+  const removeBtn = document.getElementById("removeProfilePictureBtn");
+  if (url) {
+    img.src = url; // server already appends a ?v= cache-busting version — no client-side hack needed
+    img.classList.remove("hidden");
+    emptyLabel.classList.add("hidden");
+    removeBtn.classList.remove("hidden");
+  } else {
+    img.classList.add("hidden");
+    emptyLabel.classList.remove("hidden");
+    removeBtn.classList.add("hidden");
+  }
+}
+
+// Single place that reacts to the current user's picture actually
+// changing — `me` is the source of truth used by match intro / battle bar
+// (and stays correct there since those re-render from `me` fresh at the
+// start of each match), `currentProfile` drives the Profile page. Both are
+// updated together so nothing on screen — Profile header, Edit Profile
+// preview — is left showing a stale picture without a refresh/re-login.
+function applyProfilePictureUpdate(url) {
+  if (me) me.profile_picture_url = url;
+  if (currentProfile) currentProfile.profile_picture_url = url;
+  renderProfilePicturePreview(url);
+  if (!document.getElementById("profileScreen").classList.contains("hidden")) {
+    renderAvatarInto("profileAvatarImg", "profileAvatarEmoji", url, currentProfile ? currentProfile.avatar_id : 1);
+  }
+}
+
+document.getElementById("profilePictureFileInput").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  const errEl = document.getElementById("profilePictureError");
+  errEl.textContent = "";
+  if (!file) return;
+  const formData = new FormData();
+  formData.append("picture", file);
+  try {
+    // Deliberately NOT using the shared api() helper — it always sets
+    // Content-Type: application/json, which would break a multipart
+    // upload (the browser needs to set its own boundary).
+    const res = await fetch(API + "/profile/picture", {
+      method: "POST",
+      headers: { "X-Requested-With": "PushUpEloClient" },
+      credentials: "same-origin",
+      body: formData,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "upload failed");
+    applyProfilePictureUpdate(data.profile_picture_url);
+  } catch (err) {
+    errEl.textContent = err.message;
+  } finally {
+    e.target.value = "";
+  }
+});
+
+document.getElementById("removeProfilePictureBtn").addEventListener("click", async () => {
+  try {
+    await fetch(API + "/profile/picture", {
+      method: "DELETE",
+      headers: { "X-Requested-With": "PushUpEloClient" },
+      credentials: "same-origin",
+    });
+    applyProfilePictureUpdate(null);
+  } catch (e) { /* best effort */ }
 });
 
 // ---------------------------------------------------------------- country picker
@@ -569,9 +813,14 @@ document.getElementById("saveProfileBtn").addEventListener("click", async () => 
   const countryCode = document.getElementById("editCountryCode").value; // set only via picking an option
   const bio = document.getElementById("editBioInput").value.trim();
   const avatarId = parseInt(document.getElementById("avatarPicker").dataset.selected, 10) || 1;
+  const email = document.getElementById("editEmailInput").value.trim();
+  const profileVisibility = document.getElementById("editProfileVisibilitySelect").value;
   const errorEl = document.getElementById("editProfileError");
 
-  const body = { bio, avatar_id: avatarId };
+  const body = {
+    bio, avatar_id: avatarId, email,
+    profile_visibility: profileVisibility,
+  };
   if (countryCode) {
     body.country = countryCode; // user picked a real country from the list
   } else if (countryInput.value.trim() === "") {
@@ -627,10 +876,10 @@ async function loadLeaderboard() {
       const rankLabel = i < 3 ? ["🥇", "🥈", "🥉"][i] : `#${i + 1}`;
       const meTag = (me && u.id === me.id) ? ` <span class="lbYouTag">YOU</span>` : "";
       if (tab === "all") {
-        li.innerHTML = `<span class="lbRank">${rankLabel}</span><span class="lbName"><strong>${u.username}</strong>${meTag}<br><span class="hint">${u.rank_tier} · ${u.wins}W/${u.losses}L/${u.draws}D</span></span><span class="lbElo">${u.elo}</span>`;
+        li.innerHTML = `<span class="lbRank">${rankLabel}</span><span class="lbName"><strong>${escapeHtml(u.username)}</strong>${meTag}<br><span class="hint">${escapeHtml(u.rank_tier)} · ${u.wins}W/${u.losses}L/${u.draws}D</span></span><span class="lbElo">${u.elo}</span>`;
       } else {
         const sign = u.elo_gain > 0 ? "+" : "";
-        li.innerHTML = `<span class="lbRank">${rankLabel}</span><span class="lbName"><strong>${u.username}</strong>${meTag}<br><span class="hint">${u.matches_in_window} matches</span></span><span class="lbElo">${sign}${u.elo_gain}</span>`;
+        li.innerHTML = `<span class="lbRank">${rankLabel}</span><span class="lbName"><strong>${escapeHtml(u.username)}</strong>${meTag}<br><span class="hint">${u.matches_in_window} matches</span></span><span class="lbElo">${sign}${u.elo_gain}</span>`;
       }
       list.appendChild(li);
     });
@@ -738,16 +987,128 @@ async function enterMatch(matchId) {
   enterReadyScreen(match);
 }
 
+// ---------------------------------------------------------------- AI camera onboarding
+// First-time users get the full explainer (why the camera needs a moment
+// before it starts counting); returning users get one short line plus a
+// "How it works?" link to reopen the same explainer on demand.
+//
+// V1.11: this is now a PERSISTENT PER-ACCOUNT flag (me.has_seen_pushup_
+// how_it_works, backed by /api/me + POST /api/pushup-how-it-works-seen)
+// instead of localStorage — survives switching devices/browsers, and
+// existing accounts were backfilled to "already seen" server-side during
+// migration, so nobody who has used the app before gets interrupted.
+const GET_INTO_POSITION_LONG_TEXT = "Place your hands under your shoulders, keep your body straight, and make sure your full body is visible.";
+const GET_INTO_POSITION_SHORT_TEXT = "Get into position. Wait for GO.";
+
+function hasSeenAiIntro() {
+  return !!(me && me.has_seen_pushup_how_it_works);
+}
+
+function showAiIntroModal() {
+  document.getElementById("aiIntroModal").classList.remove("hidden");
+}
+
+function dismissAiIntroModal() {
+  document.getElementById("aiIntroModal").classList.add("hidden");
+  if (me) me.has_seen_pushup_how_it_works = true;
+  api("/pushup-how-it-works-seen", { method: "POST" }).catch(() => {
+    // Best-effort — even if this particular save fails, the in-memory
+    // `me` flag above still prevents re-showing it again THIS session;
+    // it'll simply re-persist next time they dismiss it.
+  });
+}
+
+document.getElementById("aiIntroContinueBtn").addEventListener("click", () => {
+  const firstTime = !hasSeenAiIntro();
+  dismissAiIntroModal();
+  document.getElementById("getIntoPositionInstructions").textContent = GET_INTO_POSITION_SHORT_TEXT;
+  // Only a first-time viewing was actually gating the PvP camera check —
+  // reopening via "How it works?" (see below) must NOT restart it.
+  if (firstTime) startReadyCameraCheck();
+});
+
+// ---------------------------------------------------------------- RPG-specific onboarding
+// SEPARATE from the PvP explainer above (has_seen_rpg_how_it_works, its
+// own persistent per-account flag) — a player's first RPG entry gets the
+// RPG-specific game-loop explainer even if they've already dismissed the
+// PvP one, and vice versa.
+function hasSeenRpgIntro() {
+  return !!(me && me.has_seen_rpg_how_it_works);
+}
+
+function showRpgIntroModal() {
+  document.getElementById("rpgIntroModal").classList.remove("hidden");
+}
+
+function dismissRpgIntroModal() {
+  document.getElementById("rpgIntroModal").classList.add("hidden");
+  if (me) me.has_seen_rpg_how_it_works = true;
+  api("/rpg-how-it-works-seen", { method: "POST" }).catch(() => {
+    // Best-effort, same reasoning as the PvP dismiss handler above.
+  });
+}
+
+document.getElementById("rpgIntroContinueBtn").addEventListener("click", () => {
+  dismissRpgIntroModal();
+  if (pendingRpgBattleStart !== null) {
+    const monsterId = pendingRpgBattleStart;
+    pendingRpgBattleStart = null;
+    _startRpgBattleAfterIntro(monsterId);
+  }
+});
+
+document.getElementById("howItWorksLinkBtn").addEventListener("click", () => {
+  showAiIntroModal();
+});
+
 function enterReadyScreen(match) {
   document.getElementById("opponentName").textContent =
     match.is_bot_match ? "🤖 Bot" : currentOpponent.username;
   document.getElementById("opponentElo").textContent = currentOpponent.elo;
   document.getElementById("readyTitle").textContent =
     match.is_bot_match ? "Bot Match Found!" : "Opponent Found!";
+
+  // Player intro / VS row — best-effort using whatever `me` and
+  // currentOpponent already carry (both come from user_to_dict, which now
+  // includes profile_picture_url); no extra request, no extra delay.
+  document.getElementById("matchIntroMeName").textContent = me.username;
+  renderAvatarInto("matchIntroMeImg", "matchIntroMeEmoji", me.profile_picture_url, me.avatar_id);
+  document.getElementById("matchIntroOppName").textContent =
+    match.is_bot_match ? "Bot" : currentOpponent.username;
+  renderAvatarInto(
+    "matchIntroOppImg", "matchIntroOppEmoji",
+    match.is_bot_match ? null : currentOpponent.profile_picture_url,
+    currentOpponent.avatar_id
+  );
+
+  // Global rank (leaderboard position) — the player asked to see this
+  // while queued for/playing a 1v1, not just buried on the Profile
+  // screen. Reuses the exact same elo_rank the Profile page already
+  // computes; fetched here only if not already cached from a Profile
+  // visit this session, so most of the time this is free.
+  const meRankEl = document.getElementById("matchIntroMeRank");
+  if (currentProfile && typeof currentProfile.elo_rank === "number") {
+    meRankEl.textContent = `Global Rank #${currentProfile.elo_rank}`;
+  } else {
+    meRankEl.textContent = "";
+    api("/profile").then(p => {
+      currentProfile = p;
+      meRankEl.textContent = `Global Rank #${p.elo_rank}`;
+    }).catch(() => { /* best effort — ready screen still works without it */ });
+  }
+
   updateReadyStatusUI(match);
   showScreen("ready");
   pollReadyState();
-  startReadyCameraCheck();
+
+  const instructionsEl = document.getElementById("getIntoPositionInstructions");
+  if (hasSeenAiIntro()) {
+    instructionsEl.textContent = GET_INTO_POSITION_SHORT_TEXT;
+    startReadyCameraCheck();
+  } else {
+    instructionsEl.textContent = GET_INTO_POSITION_LONG_TEXT;
+    showAiIntroModal(); // startReadyCameraCheck() fires from aiIntroContinueBtn instead
+  }
 }
 
 function updateReadyStatusUI(match) {
@@ -761,7 +1122,7 @@ function updateReadyStatusUI(match) {
   oppEl.className = "readyStatusValue" + (oppReady ? " isReady" : "");
   if (myReady) {
     stopReadyCameraCheck();
-    document.getElementById("readyCheckStatusText").textContent = "✓ YOU'RE READY — waiting for opponent…";
+    document.getElementById("readyCheckStatusText").textContent = "POSITION READY ✓ — waiting for opponent…";
   }
 }
 
@@ -829,6 +1190,7 @@ let readyBrightnessCanvas = null;
 
 async function startReadyCameraCheck() {
   readyStableSince = null;
+  resetPoseTracker(pvpPoseTracker); // same tracker the actual match will use (see startCamera) — locks a side here so the match doesn't have to re-lock from scratch
   const video = document.getElementById("readyCameraVideo");
   const statusText = document.getElementById("readyCheckStatusText");
   const fallbackBtn = document.getElementById("startMatchBtn");
@@ -840,6 +1202,7 @@ async function startReadyCameraCheck() {
     });
     video.srcObject = readyCameraStream;
     await video.play();
+    setCameraActiveIndicator("readyCameraActiveIndicator", true);
 
     statusText.textContent = "🧠 Loading AI model…";
     const timeoutPromise = new Promise((_, reject) =>
@@ -860,6 +1223,7 @@ async function startReadyCameraCheck() {
 function stopReadyCameraCheck() {
   readyCameraCheckRunning = false;
   readyStableSince = null;
+  setCameraActiveIndicator("readyCameraActiveIndicator", false);
   if (readyCameraStream) {
     readyCameraStream.getTracks().forEach(t => t.stop());
     readyCameraStream = null;
@@ -910,15 +1274,17 @@ function readyCameraCheckLoop() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   let allValid = false;
-  let message = "⚠️ Move into camera view";
+  let message = "Move into camera view";
 
   if (result.landmarks && result.landmarks.length > 0) {
     const lm = result.landmarks[0];
-    const leftVis = (lm[11]?.visibility || 0) + (lm[13]?.visibility || 0) + (lm[15]?.visibility || 0) + (lm[27]?.visibility || 0);
-    const rightVis = (lm[12]?.visibility || 0) + (lm[14]?.visibility || 0) + (lm[16]?.visibility || 0) + (lm[28]?.visibility || 0);
-    const useRight = rightVis >= leftVis;
-    const idx = useRight ? [12, 14, 16, 24, 26, 28] : [11, 13, 15, 23, 25, 27];
-    const parts = idx.map(i => lm[i]);
+    // SAME shared side-lock/smoothing pipeline as the actual match/RPG
+    // loops (see trackPoseLandmarks) — no separate landmark-selection
+    // logic for the Ready screen. No rep is ever in progress here, so
+    // side-switching is always allowed (pass "up").
+    const tracked = trackPoseLandmarks(pvpPoseTracker, lm, "up");
+    const idxObj = POSE_SIDE_LANDMARKS[tracked.side];
+    const parts = [idxObj.shoulder, idxObj.elbow, idxObj.wrist, idxObj.hip, idxObj.knee, idxObj.ankle].map(i => lm[i]);
     const fullBodyVisible = parts.every(p => (p?.visibility || 0) > CONFIG.MIN_BODY_VISIBILITY);
     const lightingOk = estimateBrightness(video) >= CONFIG.MIN_LIGHTING_BRIGHTNESS;
 
@@ -933,9 +1299,9 @@ function readyCameraCheckLoop() {
     });
 
     if (!fullBodyVisible) {
-      message = "⚠️ Show your full body to the camera";
+      message = "Make sure your full body is visible";
     } else if (!lightingOk) {
-      message = "⚠️ Improve lighting";
+      message = "Improve lighting";
     } else {
       allValid = true;
     }
@@ -945,18 +1311,29 @@ function readyCameraCheckLoop() {
     if (readyStableSince === null) readyStableSince = performance.now();
     const elapsed = performance.now() - readyStableSince;
     if (elapsed >= CONFIG.CAMERA_READY_STABILITY_MS) {
-      statusText.textContent = "✓ You're ready!";
+      statusText.textContent = "POSITION READY ✓";
       stopReadyCameraCheck();
       sendReadySignal();
       return;
     }
-    statusText.textContent = "✓ Good position — hold still…";
+    statusText.textContent = "Good position — hold still…";
   } else {
     readyStableSince = null;
     statusText.textContent = message;
   }
 
   requestAnimationFrame(readyCameraCheckLoop);
+}
+
+// Populates the small avatars above the shared battle bar — same
+// picture-with-emoji-fallback pattern as the match intro, no new request.
+function renderBattleBarAvatars(isBotMatch) {
+  renderAvatarInto("battleBarMeImg", "battleBarMeEmoji", me.profile_picture_url, me.avatar_id);
+  renderAvatarInto(
+    "battleBarOppImg", "battleBarOppEmoji",
+    isBotMatch ? null : (currentOpponent ? currentOpponent.profile_picture_url : null),
+    currentOpponent ? currentOpponent.avatar_id : 1
+  );
 }
 
 // Resume a match that's already in_progress (e.g. after a refresh) using
@@ -966,6 +1343,7 @@ function resumeInProgressMatch(match) {
   pushupCount = 0;
   document.getElementById("pushupCount").textContent = "0";
   showScreen("match");
+  renderBattleBarAvatars(match.is_bot_match);
   startCamera().then(() => {
     scheduleSynchronizedStart(match.exercise_starts_at, match.expires_at);
   });
@@ -976,6 +1354,7 @@ function beginSynchronizedMatch(match) {
   pushupCount = 0;
   document.getElementById("pushupCount").textContent = "0";
   showScreen("match");
+  renderBattleBarAvatars(match.is_bot_match);
   startCamera().then(() => {
     scheduleSynchronizedStart(match.exercise_starts_at, match.expires_at);
   });
@@ -990,6 +1369,8 @@ function beginSynchronizedMatch(match) {
 function scheduleSynchronizedStart(exerciseStartsAt, expiresAt) {
   const overlay = document.getElementById("countdownOverlay");
   const numberEl = document.getElementById("countdownNumber");
+  const hintEl = document.getElementById("countdownHint");
+  hintEl.classList.remove("hidden");
 
   function tick() {
     const now = Date.now() / 1000;
@@ -1005,6 +1386,7 @@ function scheduleSynchronizedStart(exerciseStartsAt, expiresAt) {
       requestAnimationFrame(tick);
     } else {
       numberEl.textContent = "GO!";
+      hintEl.classList.add("hidden");
       playBeep(880, 0.15);
       setTimeout(() => overlay.classList.add("hidden"), 400);
       startAuthoritativeTimer(exerciseStartsAt, expiresAt);
@@ -1159,6 +1541,11 @@ let detectionRunning = false;
 let repState = "up";
 let downShoulderY = null;
 let downBodyScale = null;
+// V1.16 calibration fix: the actual peak displacement reached ANY TIME
+// during the down phase, not just a single sample at the down/up
+// transition instants — see the shoulder-movement rewrite below for why.
+let downShoulderYExtreme = 0;
+let lastPvpRepRejectedReason = null; // dev-debug only — why the last completed down->up cycle didn't count
 let pendingDownFrames = 0;
 let pendingUpFrames = 0;
 let repWasValidThroughout = true;
@@ -1242,11 +1629,301 @@ function angleBetween(a, b, c) {
   return (Math.acos(cos) * 180) / Math.PI;
 }
 
+// Shared by BOTH PvP and RPG push-up detection (previously two separate,
+// near-identical shoulder->hip->knee ANGLE checks — this replaces both
+// with one function, used from both places).
+//
+// Why a line-deviation model instead of an angle: measuring the
+// shoulder-hip-knee ANGLE is overly sensitive right at the hip — a small
+// natural hip position change swings that angle a lot near a mostly-
+// straight body, which is what made the old check feel stricter than a
+// real push-up actually requires. Measuring how far the hip strays
+// (perpendicular, body-scale-normalized) from the overall shoulder-to-
+// ankle reference line tolerates the natural curvature a real push-up has
+// while still catching genuine extreme sag/pike.
+function computeHipAlignment(shoulderPx, hipPx, anklePx) {
+  const abx = anklePx.x - shoulderPx.x, aby = anklePx.y - shoulderPx.y;
+  const bodyLength = Math.hypot(abx, aby);
+  if (bodyLength < 1) return { ratio: 0, direction: null };
+  const apx = hipPx.x - shoulderPx.x, apy = hipPx.y - shoulderPx.y;
+  const t = (apx * abx + apy * aby) / (abx * abx + aby * aby);
+  const projX = shoulderPx.x + t * abx, projY = shoulderPx.y + t * aby;
+  const ratio = Math.hypot(hipPx.x - projX, hipPx.y - projY) / bodyLength;
+  // "down" on screen is unambiguous regardless of which way the person
+  // faces, so comparing hip.y to the line's y at that point directly
+  // tells sag (hip drooping toward the floor) from pike (hip raised).
+  const direction = hipPx.y > projY ? "sag" : "pike";
+  return { ratio, direction };
+}
+
+// =============================================================================
+// V1.15 — Shared landmark side-lock + temporal tracking pipeline.
+//
+// ONE definition, used by Ready/PvP AND RPG (see poseTrackerFor() below) —
+// per spec, no separate landmark logic per screen.
+//
+// Root-cause fix for "shoulder/elbow/wrist jump between joints or switch
+// sides": the old code picked left-vs-right FRESH every single frame from
+// that frame's visibility sum alone, so a tiny noise-level confidence
+// wobble could flip the entire arm chain frame-to-frame. This replaces
+// that with: lock a side once selected, require the OTHER side to be
+// clearly and consistently better before switching, never switch mid-rep,
+// and smooth/validate the actual landmark positions before they ever
+// reach angleBetween().
+//
+// Pipeline (matches the spec's diagram exactly):
+//   raw MediaPipe landmarks -> locked side -> confidence validation ->
+//   temporal smoothing -> motion-continuity check -> anatomical-geometry
+//   validation -> smoothed shoulder/elbow/wrist -> angleBetween() -> rep
+//   state machine.
+// =============================================================================
+const POSE_SIDE_LANDMARKS = {
+  left:  { shoulder: 11, elbow: 13, wrist: 15, hip: 23, knee: 25, ankle: 27 },
+  right: { shoulder: 12, elbow: 14, wrist: 16, hip: 24, knee: 26, ankle: 28 },
+};
+const POSE_TRACKED_KEYS = ["shoulder", "elbow", "wrist", "hip", "knee", "ankle"];
+
+function createPoseTrackerState() {
+  return {
+    lockedSide: null,           // "left" | "right" | null
+    sideSwitchStreak: 0,        // consecutive frames the OTHER side has been clearly better
+    smoothed: {},                // key -> {x, y} in NORMALIZED (0-1) coords, post-EMA
+    heldThisFrame: {},           // key -> true if this frame reused the previous smoothed point (jump/geometry rejected)
+    armLen: { shoulderElbow: null, elbowWrist: null }, // slow running-average distances (normalized), this person's own baseline
+    unstableStreak: 0,           // consecutive frames where a CORE point (shoulder/elbow/wrist) had to be held
+  };
+}
+let pvpPoseTracker = createPoseTrackerState();
+let rpgPoseTracker = createPoseTrackerState();
+
+function resetPoseTracker(state) {
+  state.lockedSide = null;
+  state.sideSwitchStreak = 0;
+  state.smoothed = {};
+  state.heldThisFrame = {};
+  state.armLen = { shoulderElbow: null, elbowWrist: null };
+  state.unstableStreak = 0;
+}
+
+// `lm` = the raw MediaPipe landmark array for one frame. `repStateNow` =
+// the CALLER's current "up"/"down" state (used only to forbid a side
+// switch mid-rep, per spec — the tracker itself has no rep concept).
+// Returns smoothed, NORMALIZED points ({x,y,visibility}) plus tracking
+// status; caller converts to pixel space and feeds them into the
+// existing angle/hip/rep logic exactly as before.
+function trackPoseLandmarks(state, lm, repStateNow) {
+  const leftVis = (lm[11]?.visibility || 0) + (lm[13]?.visibility || 0) + (lm[15]?.visibility || 0);
+  const rightVis = (lm[12]?.visibility || 0) + (lm[14]?.visibility || 0) + (lm[16]?.visibility || 0);
+
+  if (state.lockedSide === null) {
+    // Initial pick only — no hysteresis needed yet, nothing to protect.
+    state.lockedSide = rightVis >= leftVis ? "right" : "left";
+    state.sideSwitchStreak = 0;
+  } else if (repStateNow !== "down") {
+    // Section 8: NEVER re-evaluate a side switch while a rep is in the
+    // "down" phase, regardless of how confident the other side looks.
+    const lockedVis = state.lockedSide === "right" ? rightVis : leftVis;
+    const otherVis = state.lockedSide === "right" ? leftVis : rightVis;
+    if (otherVis - lockedVis > CONFIG.POSE_SIDE_SWITCH_MARGIN) {
+      state.sideSwitchStreak += 1;
+      if (state.sideSwitchStreak >= CONFIG.POSE_SIDE_SWITCH_CONFIRM_FRAMES) {
+        state.lockedSide = state.lockedSide === "right" ? "left" : "right";
+        state.sideSwitchStreak = 0;
+        // Reset smoothing/geometry baselines — a genuinely new side means
+        // a genuinely new set of joints, no continuity to preserve.
+        state.smoothed = {};
+        state.armLen = { shoulderElbow: null, elbowWrist: null };
+      }
+    } else {
+      state.sideSwitchStreak = 0; // needs to be SUSTAINED, not cumulative across gaps
+    }
+  }
+
+  const idx = POSE_SIDE_LANDMARKS[state.lockedSide];
+  const rawByKey = {};
+  POSE_TRACKED_KEYS.forEach(key => { rawByKey[key] = lm[idx[key]]; });
+
+  state.heldThisFrame = {};
+  const out = {};
+  POSE_TRACKED_KEYS.forEach(key => {
+    const raw = rawByKey[key];
+    const prevSmoothed = state.smoothed[key];
+    if (!raw) {
+      // No landmark at all this frame — keep whatever we last had (if
+      // anything); the visibility/coreVisible checks downstream already
+      // handle "missing" correctly via a 0 visibility.
+      out[key] = prevSmoothed ? { ...prevSmoothed, visibility: 0 } : null;
+      return;
+    }
+
+    let candidate = { x: raw.x, y: raw.y };
+    let held = false;
+
+    // Motion continuity: a real joint can't teleport frame-to-frame.
+    if (prevSmoothed && (key === "shoulder" || key === "elbow" || key === "wrist")) {
+      const jump = Math.hypot(candidate.x - prevSmoothed.x, candidate.y - prevSmoothed.y);
+      if (jump > CONFIG.MAX_LANDMARK_JUMP) {
+        candidate = { x: prevSmoothed.x, y: prevSmoothed.y };
+        held = true;
+      }
+    }
+
+    // Temporal smoothing (EMA) — applied to whatever we're accepting
+    // this frame (the raw sample, or the held previous point).
+    const smoothed = prevSmoothed
+      ? {
+          x: CONFIG.LANDMARK_SMOOTHING_ALPHA * candidate.x + (1 - CONFIG.LANDMARK_SMOOTHING_ALPHA) * prevSmoothed.x,
+          y: CONFIG.LANDMARK_SMOOTHING_ALPHA * candidate.y + (1 - CONFIG.LANDMARK_SMOOTHING_ALPHA) * prevSmoothed.y,
+        }
+      : candidate;
+
+    state.smoothed[key] = smoothed;
+    state.heldThisFrame[key] = held;
+    out[key] = { x: smoothed.x, y: smoothed.y, visibility: raw.visibility || 0 };
+  });
+
+  // Anatomical geometry check — shoulder/elbow/wrist must keep forming a
+  // plausible arm, judged against THIS person's own recent measurements
+  // (never a hardcoded arm length). Only evaluated once a baseline exists.
+  if (out.shoulder && out.elbow && out.wrist) {
+    const seDist = Math.hypot(out.shoulder.x - out.elbow.x, out.shoulder.y - out.elbow.y);
+    const ewDist = Math.hypot(out.elbow.x - out.wrist.x, out.elbow.y - out.wrist.y);
+    const geometryOk = (label, dist, historyKey) => {
+      const avg = state.armLen[historyKey];
+      if (avg === null || avg === 0) {
+        state.armLen[historyKey] = dist; // establish baseline
+        return true;
+      }
+      const changeFrac = Math.abs(dist - avg) / avg;
+      if (changeFrac > CONFIG.ANATOMY_RATIO_TOLERANCE) {
+        return false; // this frame's geometry doesn't look like the same arm — don't fold it into the baseline
+      }
+      state.armLen[historyKey] = avg * 0.95 + dist * 0.05; // slow-moving baseline, only updated on plausible frames
+      return true;
+    };
+    const seOk = geometryOk("shoulder-elbow", seDist, "shoulderElbow");
+    const ewOk = geometryOk("elbow-wrist", ewDist, "elbowWrist");
+    if (!seOk || !ewOk) {
+      // Geometry violated — fall back to holding elbow/wrist at their
+      // previous smoothed positions rather than feeding a physically
+      // implausible arm shape into the angle calculation.
+      ["elbow", "wrist"].forEach(key => {
+        const prevSmoothed = state.smoothed[key];
+        if (prevSmoothed) {
+          out[key] = { x: prevSmoothed.x, y: prevSmoothed.y, visibility: out[key]?.visibility || 0 };
+          state.heldThisFrame[key] = true;
+        }
+      });
+    }
+  }
+
+  const coreHeld = ["shoulder", "elbow", "wrist"].some(key => state.heldThisFrame[key]);
+  state.unstableStreak = coreHeld ? state.unstableStreak + 1 : 0;
+  const tracking = state.unstableStreak >= CONFIG.UNSTABLE_TRACKING_FRAMES ? "unstable" : "stable";
+
+  return { side: state.lockedSide, points: out, tracking, coreHeldThisFrame: coreHeld };
+}
+
+// Shared visual treatment for the shoulder->elbow->wrist chain — used by
+// BOTH detectionLoop and rpgDetectionLoop. A landmark drawn in the normal
+// color is a fresh, trusted sample this frame; one drawn in the "held"
+// color means the tracker is temporarily reusing its last stable position
+// (a jump or anatomy-check rejection) rather than a fresh raw sample —
+// visually distinct so it's obvious when tracking is compensating for a
+// noisy frame instead of pretending everything is equally fresh.
+function drawTrackedArm(ctx, toPx, s, e, w, heldMap) {
+  const sPx = toPx(s), ePx = toPx(e), wPx = toPx(w);
+  ctx.strokeStyle = "#3ce8ff";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(sPx.x, sPx.y);
+  ctx.lineTo(ePx.x, ePx.y);
+  ctx.lineTo(wPx.x, wPx.y);
+  ctx.stroke();
+  [["shoulder", s], ["elbow", e], ["wrist", w]].forEach(([key, p]) => {
+    const px = toPx(p);
+    const isHeld = !!(heldMap && heldMap[key]);
+    ctx.fillStyle = isHeld ? "#ffb84d" : "#ff5a3c"; // amber = held/uncertain this frame, red = fresh/stable
+    ctx.beginPath();
+    ctx.arc(px.x, px.y, isHeld ? 7 : 6, 0, 2 * Math.PI);
+    ctx.fill();
+    if (isHeld) {
+      ctx.strokeStyle = "#ffb84d";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(px.x, px.y, 10, 0, 2 * Math.PI);
+      ctx.stroke();
+    }
+  });
+}
+
+// Dev-only visual debug overlay — gated on the SAME existing
+// localStorage.pushupElo_debug flag, never shown to normal users.
+function isPoseDebugEnabled() {
+  try { return localStorage.getItem("pushupElo_debug") === "1"; } catch (e) { return false; }
+}
+function renderPoseDebugOverlay(elId, tracked, angle, repStateNow, counting) {
+  if (!isPoseDebugEnabled()) return;
+  let el = document.getElementById(elId);
+  if (!el) {
+    el = document.createElement("pre");
+    el.id = elId;
+    el.style.cssText = "position:absolute;top:4px;left:4px;z-index:20;background:rgba(0,0,0,0.75);color:#3ce8ff;" +
+      "font:11px/1.4 monospace;padding:6px 8px;border-radius:6px;pointer-events:none;white-space:pre;margin:0;";
+    document.body.appendChild(el);
+  }
+  const canvasEl = document.getElementById(elId === "pvpPoseDebug" ? "cameraCanvas" : "rpgCameraCanvas");
+  if (canvasEl) {
+    const rect = canvasEl.getBoundingClientRect();
+    el.style.top = `${rect.top + window.scrollY + 4}px`;
+    el.style.left = `${rect.left + window.scrollX + 4}px`;
+  }
+  const p = tracked.points;
+  const fmt = pt => pt ? pt.visibility.toFixed(2) : "—";
+  let lines =
+    `SIDE: ${(tracked.side || "—").toUpperCase()}\n` +
+    `SIDE LOCKED: ${tracked.side ? "YES" : "NO"}\n` +
+    `TRACKING: ${tracked.tracking.toUpperCase()}${tracked.tracking === "unstable" ? " (holding previous landmarks)" : ""}\n` +
+    `ANGLE: ${angle !== null ? Math.round(angle) + "°" : "—"}\n` +
+    `CONFIDENCE  S ${fmt(p.shoulder)}  E ${fmt(p.elbow)}  W ${fmt(p.wrist)}\n` +
+    `REP STATE: ${repStateNow.toUpperCase()}`;
+
+  // V1.16: exact rejection-reason readout — the whole point of this pass
+  // was "tell me EXACTLY why my real push-up was rejected," not just
+  // whether tracking looks stable.
+  if (counting) {
+    const canvasScale = counting.canvasHeight || 1;
+    const movementRatio = counting.shoulderMovement / canvasScale;
+    const thresholdRatio = counting.movementThreshold / canvasScale;
+    lines += `\nSHOULDER MOVEMENT: ${movementRatio.toFixed(3)}\n` +
+      `THRESHOLD: ${thresholdRatio.toFixed(3)}\n` +
+      `CAN COUNT: ${counting.canCount ? "YES" : "NO"}`;
+    if (!counting.canCount) {
+      let reason;
+      if (!counting.coreVisible) reason = "shoulder/elbow/wrist/hip not clearly visible";
+      else if (!counting.bodyVisible) reason = "full body (knee/ankle) not visible";
+      else if (tracked.tracking === "unstable") reason = "tracking unstable — re-locking arm";
+      else if (!counting.goodAlignment) reason = `hip alignment (${counting.hipDirection || "sag/pike"}) out of range`;
+      else reason = "waiting — no rep transition yet";
+      lines += `\nREASON: ${reason}`;
+    } else if (counting.lastRepRejectedReason) {
+      lines += `\nLAST REP REJECTED: ${counting.lastRepRejectedReason}`;
+    }
+  }
+  el.textContent = lines;
+  el.style.display = "block";
+}
+function hidePoseDebugOverlay(elId) {
+  const el = document.getElementById(elId);
+  if (el) el.style.display = "none";
+}
+
 async function startCamera() {
   const video = document.getElementById("cameraVideo");
   const statusEl = document.getElementById("cameraStatus");
   repState = "up";
   downShoulderY = null;
+  downShoulderYExtreme = 0;
   downBodyScale = null;
   pendingDownFrames = 0;
   pendingUpFrames = 0;
@@ -1257,6 +1934,7 @@ async function startCamera() {
   lastFeedbackChangeTime = 0;
   flatZStreak = 0;
   livenessWarningShown = false;
+  resetPoseTracker(pvpPoseTracker);
   setManualButtonEnabled(false);
 
   try {
@@ -1269,6 +1947,7 @@ async function startCamera() {
     });
     video.srcObject = cameraStream;
     await video.play();
+    setCameraActiveIndicator("cameraActiveIndicator", true);
 
     statusEl.textContent = "🧠 Loading AI model… (first time takes ~10-15s)";
 
@@ -1293,6 +1972,8 @@ function setManualButtonEnabled(enabled) {
 
 function stopCamera() {
   detectionRunning = false;
+  setCameraActiveIndicator("cameraActiveIndicator", false);
+  hidePoseDebugOverlay("pvpPoseDebug");
   if (cameraStream) {
     cameraStream.getTracks().forEach(t => t.stop());
     cameraStream = null;
@@ -1324,11 +2005,8 @@ function detectionLoop() {
 
     if (result.landmarks && result.landmarks.length > 0) {
       const lm = result.landmarks[0];
-      const leftVis = (lm[11]?.visibility || 0) + (lm[13]?.visibility || 0) + (lm[15]?.visibility || 0);
-      const rightVis = (lm[12]?.visibility || 0) + (lm[14]?.visibility || 0) + (lm[16]?.visibility || 0);
-      const useRight = rightVis >= leftVis;
-      const idx = useRight ? [12, 14, 16, 24, 26, 28] : [11, 13, 15, 23, 25, 27];
-      const [s, e, w, hip, knee, ankle] = idx.map(i => lm[i]);
+      const tracked = trackPoseLandmarks(pvpPoseTracker, lm, repState);
+      const { shoulder: s, elbow: e, wrist: w, hip, knee, ankle } = tracked.points;
 
       if (s && e && w) {
         const toPx = p => ({ x: p.x * canvas.width, y: p.y * canvas.height });
@@ -1336,34 +2014,29 @@ function detectionLoop() {
         const shoulderPx = toPx(s);
         const hipPx = hip ? toPx(hip) : null;
 
-        ctx.strokeStyle = "#3ce8ff";
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.moveTo(toPx(s).x, toPx(s).y);
-        ctx.lineTo(toPx(e).x, toPx(e).y);
-        ctx.lineTo(toPx(w).x, toPx(w).y);
-        ctx.stroke();
-        [s, e, w].forEach(p => {
-          const px = toPx(p);
-          ctx.fillStyle = "#ff5a3c";
-          ctx.beginPath();
-          ctx.arc(px.x, px.y, 6, 0, 2 * Math.PI);
-          ctx.fill();
-        });
+        drawTrackedArm(ctx, toPx, s, e, w, pvpPoseTracker.heldThisFrame);
 
         const coreVisible = [s, e, w, hip].every(p => (p?.visibility || 0) > CONFIG.MIN_LANDMARK_VISIBILITY);
         const bodyVisible = [knee, ankle].every(p => (p?.visibility || 0) > CONFIG.MIN_BODY_VISIBILITY);
 
         let goodAlignment = true;
-        if (hip && knee && coreVisible) {
-          const hipAngle = angleBetween(toPx(s), toPx(hip), toPx(knee));
-          goodAlignment = Math.abs(180 - hipAngle) < CONFIG.MAX_HIP_SAG_DEVIATION;
+        let hipDirection = null;
+        if (hip && ankle && bodyVisible) {
+          const { ratio, direction } = computeHipAlignment(shoulderPx, toPx(hip), toPx(ankle));
+          goodAlignment = ratio < CONFIG.MAX_HIP_DEVIATION_RATIO;
+          hipDirection = direction;
         }
 
         // Practical, non-blocking liveness signal — see checkLivenessSignal
         // for what this is (and isn't). Never affects canCount/rep counting.
+        // Uses the RAW (pre-smoothing) landmarks for the locked side —
+        // liveness is a depth-variance check on .z, which the smoothed
+        // tracker output intentionally doesn't carry (it only tracks x/y).
         if (coreVisible) {
-          const zResult = checkLivenessSignal({ shoulder: s, elbow: e, wrist: w, hip, knee, ankle }, flatZStreak);
+          const rawIdx = POSE_SIDE_LANDMARKS[tracked.side];
+          const rawPts = { shoulder: lm[rawIdx.shoulder], elbow: lm[rawIdx.elbow], wrist: lm[rawIdx.wrist],
+                            hip: lm[rawIdx.hip], knee: lm[rawIdx.knee], ankle: lm[rawIdx.ankle] };
+          const zResult = checkLivenessSignal(rawPts, flatZStreak);
           flatZStreak = zResult.streak;
           if (zResult.shouldWarn && !livenessWarningShown) {
             livenessWarningShown = true;
@@ -1375,15 +2048,41 @@ function detectionLoop() {
           setDetectionFeedback("⚠️ Show your full body to the camera.");
         } else if (!bodyVisible) {
           setDetectionFeedback("Stand sideways with your full body visible.");
+        } else if (tracked.tracking === "unstable") {
+          setDetectionFeedback("⚠️ Keep your side position — AI is re-locking your arm.");
         } else if (!goodAlignment) {
-          setDetectionFeedback("Keep your body straight (don't sag your hips).");
+          setDetectionFeedback(hipDirection === "sag" ? "Move your hips slightly up." : "Lower your hips slightly.");
         } else if (repState === "down") {
           setDetectionFeedback("Go a bit lower and fully extend your arms!");
         } else {
           setDetectionFeedback("Good — keep going!");
         }
 
-        const canCount = coreVisible && bodyVisible && goodAlignment;
+        // Section 14: never count off an unstable/held tracking frame —
+        // wait for the tracker to recover rather than guessing.
+        const canCount = coreVisible && bodyVisible && goodAlignment && tracked.tracking === "stable";
+
+        // V1.16: continuously track the peak shoulder displacement reached
+        // at ANY point during the down phase — not just a single sample at
+        // the down/up transition instants. EMA smoothing (needed for the
+        // landmark-stability fix) attenuates the amplitude of a fast
+        // oscillating signal like shoulder.y during a real push-up, so
+        // sampling only at the two transition boundaries could
+        // systematically underestimate genuine movement and reject valid
+        // reps. Tracking the running extreme fixes this without touching
+        // the smoothing itself — still built entirely from the SAME
+        // validated/smoothed points, never raw landmarks.
+        if (repState === "down" && downShoulderY !== null) {
+          downShoulderYExtreme = Math.max(downShoulderYExtreme, Math.abs(shoulderPx.y - downShoulderY));
+        }
+
+        renderPoseDebugOverlay("pvpPoseDebug", tracked, angle, repState, {
+          shoulderMovement: downShoulderYExtreme,
+          movementThreshold: downBodyScale ? CONFIG.MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO * downBodyScale : CONFIG.MIN_SHOULDER_MOVEMENT_RATIO * canvas.height,
+          canvasHeight: canvas.height,
+          canCount, coreVisible, bodyVisible, goodAlignment, hipDirection,
+          lastRepRejectedReason: lastPvpRepRejectedReason,
+        });
 
         // Continuously track validity through the "down" phase — brief
         // drops (pose jitter, a frame of low confidence) are tolerated,
@@ -1411,6 +2110,7 @@ function detectionLoop() {
             repState = "down";
             pendingDownFrames = 0;
             downShoulderY = shoulderPx.y;
+            downShoulderYExtreme = 0;
             downBodyScale = hipPx ? Math.hypot(shoulderPx.x - hipPx.x, shoulderPx.y - hipPx.y) : null;
             repWasValidThroughout = canCount;
             invalidStreak = 0;
@@ -1433,8 +2133,11 @@ function detectionLoop() {
             const threshold = downBodyScale
               ? CONFIG.MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO * downBodyScale
               : CONFIG.MIN_SHOULDER_MOVEMENT_RATIO * canvas.height;
-            const shoulderMoved =
-              downShoulderY !== null && Math.abs(shoulderPx.y - downShoulderY) > threshold;
+            // Peak displacement reached anywhere during the down phase
+            // (see the tracking update above) — NOT a single sample taken
+            // right at this noisy transition instant.
+            downShoulderYExtreme = Math.max(downShoulderYExtreme, Math.abs(shoulderPx.y - downShoulderY));
+            const shoulderMoved = downShoulderY !== null && downShoulderYExtreme > threshold;
             const enoughTimePassed = now - lastRepTimestamp > CONFIG.MIN_REP_INTERVAL_MS;
             const underCeiling = pushupCount < CONFIG.MAX_PUSHUPS_60S;
 
@@ -1445,8 +2148,18 @@ function detectionLoop() {
               if (navigator.vibrate) navigator.vibrate(15);
               playBeep(660, 0.08);
               setDetectionFeedback("Nice rep! 👍");
+              lastPvpRepRejectedReason = null;
+            } else if (isPoseDebugEnabled()) {
+              // Dev-debug only — pinpoint exactly which condition killed
+              // this specific down->up cycle, not just a generic "no."
+              if (!repWasValidThroughout) lastPvpRepRejectedReason = "lost tracking/visibility during the down phase";
+              else if (!shoulderMoved) lastPvpRepRejectedReason = `shoulder movement too small (${(downShoulderYExtreme / canvas.height).toFixed(3)} < ${(threshold / canvas.height).toFixed(3)})`;
+              else if (!enoughTimePassed) lastPvpRepRejectedReason = "too soon after the previous rep";
+              else if (!underCeiling) lastPvpRepRejectedReason = "60s rep ceiling reached";
+              else lastPvpRepRejectedReason = "angle never reached UP threshold cleanly";
             }
             downShoulderY = null;
+            downShoulderYExtreme = 0;
             downBodyScale = null;
           }
         } else {
@@ -1570,6 +2283,7 @@ function showResult(match) {
     levelUpBanner.textContent = `🎉 LEVEL UP! You reached Level ${level}.`;
     levelUpBanner.classList.remove("hidden");
     playBeep(1318, 0.2);
+    spawnEmberParticles(levelUpBanner, 8);
   } else {
     levelUpBanner.classList.add("hidden");
   }
@@ -1682,10 +2396,24 @@ function pollRematchStatus() {
 // notifications, activity feed, friends leaderboard, lightweight online status.
 // =============================================================================
 
-const NOTIF_POLL_MS = 15000;   // how often to refresh the unread-count badge
+// ROOT CAUSE (challenge delivery bug): this used to be a single 15000ms
+// interval, so a freshly-sent challenge could sit unseen for up to 15s —
+// which reads as "the second challenge failed to arrive" even though the
+// server-side notification was created correctly (visiting Notifications
+// triggers an immediate un-cached fetch, which is why it "worked" there).
+// Fix: poll faster while the tab is actually visible/focused (where an
+// "immediate" delivery actually matters to the user), fall back to a slow
+// interval while backgrounded to avoid extra server load, and force one
+// immediate refresh the moment the tab regains focus/visibility.
+const NOTIF_POLL_MS_ACTIVE = 3000;    // foregrounded: fast enough to feel immediate
+const NOTIF_POLL_MS_BACKGROUND = 20000; // backgrounded: don't burn requests on a tab no one is watching
 const HEARTBEAT_MS = 40000;    // how often to ping /api/heartbeat (last_seen)
 let notifPollInterval = null;
 let heartbeatInterval = null;
+
+function currentNotifPollMs() {
+  return (typeof document !== "undefined" && document.hidden) ? NOTIF_POLL_MS_BACKGROUND : NOTIF_POLL_MS_ACTIVE;
+}
 
 const OUTCOME_ICON = {
   FRIEND_REQUEST: "👋", FRIEND_ACCEPTED: "🤝", CHALLENGE_RECEIVED: "⚔️",
@@ -1712,7 +2440,20 @@ function startHeartbeat() {
 function startNotifPolling() {
   clearInterval(notifPollInterval);
   refreshUnreadBadge();
-  notifPollInterval = setInterval(refreshUnreadBadge, NOTIF_POLL_MS);
+  notifPollInterval = setInterval(refreshUnreadBadge, currentNotifPollMs());
+}
+
+// Re-arm the interval at the right cadence when visibility changes, and —
+// this is the part that actually fixes "only shows up after opening
+// Notifications" — fetch immediately the moment the tab becomes visible
+// again instead of waiting for the next tick.
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (!notifPollInterval) return; // not logged in / polling not started yet
+    clearInterval(notifPollInterval);
+    notifPollInterval = setInterval(refreshUnreadBadge, currentNotifPollMs());
+    if (!document.hidden) refreshUnreadBadge();
+  });
 }
 
 async function refreshUnreadBadge() {
@@ -1798,7 +2539,7 @@ document.getElementById("markAllReadBtn").addEventListener("click", async () => 
 });
 
 function notifText(n) {
-  const who = n.actor_username || "Someone";
+  const who = escapeHtml(n.actor_username || "Someone");
   switch (n.type) {
     case "FRIEND_REQUEST": return `${who} sent a friend request.`;
     case "FRIEND_ACCEPTED": return `${who} accepted your friend request.`;
@@ -1886,7 +2627,7 @@ document.getElementById("playerSearchInput").addEventListener("input", (e) => {
         li.innerHTML = `
           <span class="onlineDot ${u.online ? "isOnline" : ""}"></span>
           <span class="avatarSmall">${avatarEmoji(u.avatar_id)}</span>
-          <span class="friendListName">${u.username}</span>
+          <span class="friendListName">${escapeHtml(u.username)}</span>
           <span class="hint">${u.rank_tier} · ${u.elo}</span>
         `;
         li.addEventListener("click", () => openPublicProfile(u.username));
@@ -1916,7 +2657,7 @@ async function loadFriendRequests() {
       div.className = "requestCard";
       div.innerHTML = `
         <span class="avatarSmall">${avatarEmoji(req.avatar_id)}</span>
-        <span class="friendListName">${req.username}</span>
+        <span class="friendListName">${escapeHtml(req.username)}</span>
         <button class="reqAcceptBtn" data-id="${req.id}">Accept</button>
         <button class="reqDeclineBtn secondary" data-id="${req.id}">Decline</button>
       `;
@@ -1940,7 +2681,7 @@ async function loadFriendRequests() {
       div.className = "requestCard";
       div.innerHTML = `
         <span class="avatarSmall">${avatarEmoji(req.avatar_id)}</span>
-        <span class="friendListName">${req.username}</span>
+        <span class="friendListName">${escapeHtml(req.username)}</span>
         <span class="hint">Pending…</span>
         <button class="reqCancelBtn secondary" data-id="${req.id}">Cancel</button>
       `;
@@ -1971,7 +2712,7 @@ async function loadFriendsList() {
       li.innerHTML = `
         <span class="onlineDot ${f.online ? "isOnline" : ""}"></span>
         <span class="avatarSmall">${avatarEmoji(f.avatar_id)}</span>
-        <span class="friendListName">${f.username}<br><span class="hint">${f.rank_tier} · ${f.elo} Elo${f.current_streak >= 2 ? " · 🔥" + f.current_streak : ""}</span></span>
+        <span class="friendListName">${escapeHtml(f.username)}<br><span class="hint">${escapeHtml(f.rank_tier)} · ${f.elo} Elo${f.current_streak >= 2 ? " · 🔥" + f.current_streak : ""}</span></span>
         <button class="challengeBtn" data-id="${f.id}">Challenge</button>
       `;
       li.querySelector(".friendListName").addEventListener("click", () => openPublicProfile(f.username));
@@ -2025,13 +2766,65 @@ async function openPublicProfile(username) {
     const bioEl = document.getElementById("publicProfileBio");
     if (p.bio) { bioEl.textContent = p.bio; bioEl.classList.remove("hidden"); }
     else bioEl.classList.add("hidden");
+    const joinEl = document.getElementById("publicProfileJoinDate");
+    if (p.created_at) {
+      const d = new Date(p.created_at);
+      joinEl.textContent = isNaN(d) ? "" : `Joined ${d.toLocaleDateString(undefined, { year: "numeric", month: "long" })}`;
+      joinEl.classList.toggle("hidden", isNaN(d));
+    } else {
+      joinEl.classList.add("hidden");
+    }
+
+    const restrictedNote = document.getElementById("publicProfileRestrictedNote");
+    const rpgSection = document.getElementById("publicProfileRpgSection");
+    const statsBox = document.getElementById("publicProfileStats");
+    const achTitle = document.getElementById("publicProfileAchTitle");
+    const achGrid = document.getElementById("publicProfileAchievements");
+
+    if (p.restricted) {
+      restrictedNote.classList.remove("hidden");
+      rpgSection.classList.add("hidden");
+      statsBox.classList.add("hidden");
+      achTitle.classList.add("hidden");
+      achGrid.innerHTML = "";
+      renderPublicProfileAction(p);
+      showScreen("publicProfile");
+      return;
+    }
+    restrictedNote.classList.add("hidden");
+    statsBox.classList.remove("hidden");
+    achTitle.classList.remove("hidden");
 
     document.getElementById("publicProfileElo").textContent = p.elo;
+    document.getElementById("publicProfilePeakElo").textContent = p.peak_elo;
+    const totalMatches = p.wins + p.losses + p.draws;
+    document.getElementById("publicProfileWinRate").textContent =
+      totalMatches > 0 ? `${Math.round(100 * p.wins / totalMatches)}%` : "—";
+    document.getElementById("publicProfileTotalMatches").textContent = totalMatches;
     document.getElementById("publicProfileWins").textContent = p.wins;
     document.getElementById("publicProfileLosses").textContent = p.losses;
     document.getElementById("publicProfileBest").textContent = p.best_pushups;
+    document.getElementById("publicProfileTotalPushups").textContent = p.total_pushups;
 
-    const achGrid = document.getElementById("publicProfileAchievements");
+    // Character + RPG progression — same renderEquippedCharacter() used
+    // everywhere else; this player's ACTUAL current tier, never a
+    // default/placeholder (p.rpg is null only if they've genuinely never
+    // touched the RPG at all).
+    if (p.rpg) {
+      rpgSection.classList.remove("hidden");
+      document.getElementById("publicProfileCharacterPortrait").innerHTML = renderEquippedCharacter(p.rpg, 110);
+      document.getElementById("publicProfileRpgBadge").innerHTML = renderRankBadge(p.rpg.rpg_rank, 36);
+      document.getElementById("publicProfileRpgLevelText").textContent = `LEVEL ${p.rpg.rpg_level} · ${p.rpg.rpg_rank.toUpperCase()}`;
+      document.getElementById("publicProfileEmberfallReps").textContent =
+        `${p.rpg.emberfall_progress_value.toLocaleString()} / ${p.rpg.emberfall_progress_total.toLocaleString()} reps reclaimed`;
+      document.getElementById("publicProfileChestLabel").textContent = `🛡 ${p.rpg.current_armor}`;
+      document.getElementById("publicProfileShieldLabel").textContent = `🔰 ${p.rpg.current_shield}`;
+      document.getElementById("publicProfileRealmsLine").textContent =
+        `Realms Reclaimed: ${p.rpg.realms_completed} / ${p.rpg.realms_total}`;
+    } else {
+      rpgSection.classList.add("hidden");
+    }
+
     achGrid.innerHTML = "";
     achGrid.className = "achievementsGridSmall";
     p.achievements.forEach(a => {
@@ -2041,6 +2834,7 @@ async function openPublicProfile(username) {
       box.textContent = a.icon;
       achGrid.appendChild(box);
     });
+    achTitle.textContent = `Achievements (${p.achievement_count} / ${p.achievement_total})`;
 
     renderPublicProfileAction(p);
     showScreen("publicProfile");
@@ -2111,7 +2905,7 @@ document.querySelectorAll(".lbTab[data-tab='friends']").forEach(btn => {
         else if (i === 1) li.classList.add("lbRowTop2");
         else if (i === 2) li.classList.add("lbRowTop3");
         const rankLabel = i < 3 ? ["🥇", "🥈", "🥉"][i] : `#${i + 1}`;
-        li.innerHTML = `<span class="lbRank">${rankLabel}</span><span class="lbName"><strong>${u.username}</strong><br><span class="hint">${u.rank_tier}</span></span><span class="lbElo">${u.elo}</span>`;
+        li.innerHTML = `<span class="lbRank">${rankLabel}</span><span class="lbName"><strong>${escapeHtml(u.username)}</strong><br><span class="hint">${escapeHtml(u.rank_tier)}</span></span><span class="lbElo">${u.elo}</span>`;
         list.appendChild(li);
       });
     } catch (e) { /* non-critical */ }
@@ -2139,15 +2933,21 @@ resumeActiveMatchIfAny = async function() {
 
 document.getElementById("navRpgBtn").addEventListener("click", () => {
   setActiveNav(document.getElementById("navRpgBtn"));
-  loadRpgHome();
-  showScreen("rpgHome");
+  loadRpgWorld();
+  showScreen("rpgWorld");
 });
 
 // screens map + setActiveNav need the new RPG screens/tab included.
+screens.rpgWorld = document.getElementById("rpgWorldScreen");
 screens.rpgHome = document.getElementById("rpgHomeScreen");
 screens.rpgBattle = document.getElementById("rpgBattleScreen");
 screens.rpgResult = document.getElementById("rpgResultScreen");
 IN_MATCH_SCREENS.add("rpgBattle");
+
+document.getElementById("rpgBackToWorldBtn").addEventListener("click", () => {
+  loadRpgWorld();
+  showScreen("rpgWorld");
+});
 
 const _origSetActiveNav = setActiveNav;
 setActiveNav = function(activeBtn) {
@@ -2155,31 +2955,618 @@ setActiveNav = function(activeBtn) {
   _origSetActiveNav(activeBtn);
 };
 
-let rpgProfileCache = null;
+// =============================================================================
+// VISOREP RPG — original SVG asset library (NO emoji as primary art)
+// -----------------------------------------------------------------------------
+// Every function below returns a self-contained inline <svg> string. Each
+// call gets a unique id suffix so gradients/filters never collide when the
+// same badge/emblem renders more than once on a page (e.g. RPG home +
+// Profile at the same time). These are original vector constructions —
+// simple, clean geometric shapes, not photorealistic illustration; see the
+// implementation report for what's still a placeholder awaiting real
+// artwork versus what's final.
+// =============================================================================
+let _svgIdCounter = 0;
+function _svgId(prefix) { return `${prefix}${_svgIdCounter++}`; }
 
-async function loadRpgHome() {
+// ---- Rank badges: Novice -> Legend, each visually DISTINCT (not just a
+// recolor) — escalating silhouette complexity, wing flares, and glow,
+// styled after the approved dark-fantasy reference board's badge row. ----
+const RPG_RANK_THEME = {
+  Novice:  { primary: "#8a6a4a", secondary: "#3a2f22", glow: null,                     wings: 0, icon: "none" },
+  Fighter: { primary: "#9aa0aa", secondary: "#2a2c31", glow: null,                     wings: 0, icon: "blade" },
+  Warrior: { primary: "#c0a060", secondary: "#2a1f14", glow: "#c0a06033",             wings: 1, icon: "crossblades" },
+  Elite:   { primary: "#2aa6b7", secondary: "#12262a", glow: "#2aa6b755",             wings: 1, icon: "spark" },
+  Master:  { primary: "#ffb347", secondary: "#2a220f", glow: "#ffb34766",             wings: 2, icon: "star" },
+  Legend:  { primary: "#ff5a1f", secondary: "#1c0906", glow: "#ff5a1f88",             wings: 2, icon: "aura" },
+};
+function rankBadgeSvg(rank, size = 56) {
+  const t = RPG_RANK_THEME[rank] || RPG_RANK_THEME.Novice;
+  const id = _svgId("rank");
+  // Pointed hexagonal shield, closer to the reference badge silhouette
+  // than a rounded crest — flat shoulders, sharp base point.
+  const shield = "M32 4 L52 12 L52 30 C52 46 44 54 32 60 C20 54 12 46 12 30 L12 12 Z";
+  let wings = "";
+  for (let i = 0; i < t.wings; i++) {
+    const y = 22 + i * 8;
+    wings += `<path d="M12 ${y} L2 ${y - 4} L4 ${y + 6} L12 ${y + 4} Z M52 ${y} L62 ${y - 4} L60 ${y + 6} L52 ${y + 4} Z" fill="${t.primary}" opacity="${0.85 - i * 0.15}"/>`;
+  }
+  let icon = "";
+  if (t.icon === "blade") icon = `<path d="M32 20 L32 44 M26 24 L38 24" stroke="${t.secondary}" stroke-width="2.5" stroke-linecap="round"/>`;
+  if (t.icon === "crossblades") icon = `<path d="M23 20 L41 42 M41 20 L23 42" stroke="${t.secondary}" stroke-width="2.5" stroke-linecap="round"/>`;
+  if (t.icon === "spark") icon = `<path d="M32 18 L36 30 L32 30 L36 44 L26 28 L31 28 Z" fill="${t.secondary}"/>`;
+  if (t.icon === "star") icon = `<path d="M32 18 L35 27 L44 27 L37 33 L39 42 L32 37 L25 42 L27 33 L20 27 L29 27 Z" fill="${t.secondary}"/>`;
+  if (t.icon === "aura") icon = `<circle cx="32" cy="32" r="6" fill="${t.secondary}"/><circle cx="32" cy="32" r="10" fill="none" stroke="${t.secondary}" stroke-width="1.5" opacity="0.7"/><circle cx="32" cy="32" r="14" fill="none" stroke="${t.primary}" stroke-width="1" opacity="0.4"/>`;
+  return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="${id}g" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${t.primary}"/><stop offset="100%" stop-color="${t.secondary}"/>
+      </linearGradient>
+      ${t.glow ? `<filter id="${id}f" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="2.4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>` : ""}
+    </defs>
+    ${wings}
+    <path d="${shield}" fill="url(#${id}g)" stroke="${t.secondary}" stroke-width="2" ${t.glow ? `filter="url(#${id}f)"` : ""}/>
+    <path d="${shield}" transform="scale(0.82)" transform-origin="32 32" fill="none" stroke="${t.primary}" stroke-width="1" opacity="0.4"/>
+    ${icon}
+  </svg>`;
+}
+
+// ---- Realm emblems — a shield crest with a realm-specific glyph, styled
+// after the reference board's realm badges. ----
+const REALM_THEME = {
+  emberfall:  { primary: "#ff5a1f", secondary: "#2a1610", glyph: "flame" },
+  thornveil:  { primary: "#5fae5a", secondary: "#152a18", glyph: "thorn" },
+  stoneheart: { primary: "#9aa0aa", secondary: "#22262c", glyph: "peak" },
+  ironreach:  { primary: "#c7c9cf", secondary: "#26282e", glyph: "tower" },
+  stormspire: { primary: "#2aa6b7", secondary: "#12262a", glyph: "bolt" },
+};
+function realmEmblemSvg(code, size = 40) {
+  const t = REALM_THEME[code] || REALM_THEME.emberfall;
+  const id = _svgId("realm");
+  const shield = "M32 6 L50 14 V30 C50 42 42 50 32 56 C22 50 14 42 14 30 V14 Z";
+  let glyph = "";
+  if (t.glyph === "flame") glyph = `<path d="M32 16 C26 24 22 28 22 35 C22 42 27 46 32 46 C37 46 42 42 42 35 C42 30 39 27 37 23 C37 27 34 28 33 25 C31 21 34 18 32 16 Z" fill="${t.primary}"/>`;
+  if (t.glyph === "thorn") glyph = `<path d="M32 16 L32 46 M32 22 L25 27 M32 28 L39 33 M32 34 L25 39" stroke="${t.primary}" stroke-width="2.5" stroke-linecap="round" fill="none"/>`;
+  if (t.glyph === "peak") glyph = `<path d="M19 42 L27 24 L33 33 L38 26 L45 42 Z" fill="${t.primary}"/>`;
+  if (t.glyph === "tower") glyph = `<path d="M25 44 V27 H29 V23 H35 V27 H39 V44 Z M28 23 V19 H31 V23 M33 23 V19 H36 V23" fill="${t.primary}"/>`;
+  if (t.glyph === "bolt") glyph = `<path d="M35 16 L24 34 L31 34 L28 46 L41 27 L33 27 Z" fill="${t.primary}"/>`;
+  return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+    <defs><linearGradient id="${id}g" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${t.secondary}"/><stop offset="100%" stop-color="#0a0b0d"/></linearGradient></defs>
+    <path d="${shield}" fill="url(#${id}g)" stroke="${t.primary}" stroke-width="2"/>
+    <path d="${shield}" transform="scale(0.86)" transform-origin="32 32" fill="none" stroke="${t.primary}" stroke-width="1" opacity="0.4"/>
+    ${glyph}
+  </svg>`;
+}
+
+// ---- Emberfall location markers — one glyph per named location. ----
+function locationMarkerSvg(locationName, isBoss, size = 34) {
+  const primary = isBoss ? "#ff5a3c" : "#ffb84d";
+  const secondary = isBoss ? "#2a1008" : "#241a0d";
+  const id = _svgId("loc");
+  const glyphs = {
+    "Ashen Gate": `<path d="M18 44 V24 Q32 12 46 24 V44 M18 44 H46 M24 44 V30 M40 44 V30" stroke="${primary}" stroke-width="2.5" fill="none" stroke-linecap="round"/>`,
+    "Cinder Road": `<path d="M16 44 L32 16 L48 44 Z" fill="none" stroke="${primary}" stroke-width="2.5"/><circle cx="32" cy="34" r="2.5" fill="${primary}"/>`,
+    "Ember Ruins": `<path d="M20 44 V26 H27 V44 M37 44 V20 H44 V44" stroke="${primary}" stroke-width="2.5" fill="none" stroke-linecap="round"/>`,
+    "Fallen Shrine": `<path d="M16 26 L32 16 L48 26 M20 26 V44 H44 V26" stroke="${primary}" stroke-width="2.5" fill="none" stroke-linejoin="round"/>`,
+    "Iron Bastion": `<path d="M22 44 V22 H27 V18 H37 V22 H42 V44 Z M27 22 H37" stroke="${primary}" stroke-width="2.5" fill="none" stroke-linejoin="round"/>`,
+    "Ashen Guardian": `<path d="M32 14 L44 22 V36 C44 44 38 48 32 50 C26 48 20 44 20 36 V22 Z" fill="none" stroke="${primary}" stroke-width="2.5"/><circle cx="32" cy="30" r="4" fill="${primary}"/>`,
+  };
+  return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+    <defs><radialGradient id="${id}g"><stop offset="0%" stop-color="${secondary}"/><stop offset="100%" stop-color="#0c0d10"/></radialGradient></defs>
+    <circle cx="32" cy="32" r="28" fill="url(#${id}g)" stroke="${primary}" stroke-width="1.5" opacity="0.9"/>
+    ${glyphs[locationName] || glyphs["Ember Ruins"]}
+  </svg>`;
+}
+
+// ---- Monster silhouettes — generic tier-based shapes (placeholder art;
+// see final report). Keyed by difficulty tier, boss gets its own larger
+// winged silhouette rather than a scaled-up regular monster. ----
+function monsterSilhouetteSvg(difficulty, isBoss, size = 44) {
+  const id = _svgId("mon");
+  const primary = isBoss ? "#c94b3a" : "#8a93a3";
+  if (isBoss) {
+    return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+      <defs><radialGradient id="${id}g"><stop offset="0%" stop-color="${primary}55"/><stop offset="100%" stop-color="transparent"/></radialGradient></defs>
+      <circle cx="32" cy="32" r="30" fill="url(#${id}g)"/>
+      <path d="M32 12 L14 26 L18 44 L32 54 L46 44 L50 26 Z M22 22 L10 16 L18 30 Z M42 22 L54 16 L46 30 Z" fill="${primary}" opacity="0.9"/>
+      <circle cx="26" cy="30" r="2" fill="#160a08"/><circle cx="38" cy="30" r="2" fill="#160a08"/>
+    </svg>`;
+  }
+  const shapes = [
+    `<circle cx="32" cy="36" r="16" fill="${primary}"/>`, // 1: slime blob
+    `<path d="M32 14 C22 14 18 24 20 34 L16 44 L26 40 L32 44 L38 40 L48 44 L44 34 C46 24 42 14 32 14 Z" fill="${primary}"/>`, // 2: goblin
+    `<path d="M32 14 C24 14 20 20 20 26 C20 30 22 32 22 32 L18 46 H46 L42 32 C42 32 44 30 44 26 C44 20 40 14 32 14 Z M26 24 h4 v4 h-4 Z M34 24 h4 v4 h-4 Z" fill="${primary}"/>`, // 3: skeleton
+    `<path d="M32 12 C20 12 16 22 18 32 C14 34 14 44 20 48 H44 C50 44 50 34 46 32 C48 22 44 12 32 12 Z" fill="${primary}"/>`, // 4: orc
+    `<path d="M32 16 L24 10 L26 20 C18 22 14 30 16 40 L12 46 L22 44 L32 50 L42 44 L52 46 L48 40 C50 30 46 22 38 20 L40 10 Z" fill="${primary}"/>`, // 5: demon
+  ];
+  return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">${shapes[Math.min(difficulty, shapes.length) - 1] || shapes[0]}</svg>`;
+}
+
+// ---- Equipment icon — chest armor (the only slot populated in V1). ----
+function equipmentIconSvg(slot, acquired, size = 28) {
+  const id = _svgId("eq");
+  const primary = acquired ? "#ffb84d" : "#5a5f6b";
+  if (slot === "chest") {
+    return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+      <defs>${acquired ? `<filter id="${id}f"><feGaussianBlur stdDeviation="1.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>` : ""}</defs>
+      <path d="M32 12 L44 18 V30 C44 42 38 48 32 52 C26 48 20 42 20 30 V18 Z M32 18 V46" fill="${acquired ? primary + "33" : "transparent"}" stroke="${primary}" stroke-width="2.5" ${acquired ? `filter="url(#${id}f)"` : ""}/>
+    </svg>`;
+  }
+  if (slot === "shield") {
+    return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+      <defs>${acquired ? `<filter id="${id}f"><feGaussianBlur stdDeviation="1.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>` : ""}</defs>
+      <path d="M32 10 L48 16 V30 C48 42 41 50 32 54 C23 50 16 42 16 30 V16 Z" fill="${acquired ? primary + "33" : "transparent"}" stroke="${primary}" stroke-width="2.5" ${acquired ? `filter="url(#${id}f)"` : ""}/>
+      <path d="M32 20 L32 44 M22 28 L42 28" stroke="${primary}" stroke-width="2" opacity="${acquired ? 0.8 : 0.4}"/>
+    </svg>`;
+  }
+  // Generic locked-slot placeholder for equipment types with no icon defined yet.
+  return `<svg viewBox="0 0 64 64" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="32" cy="32" r="20" fill="none" stroke="${primary}" stroke-width="2.5" stroke-dasharray="4 4"/>
+  </svg>`;
+}
+
+// =============================================================================
+// VISOREP RPG — real uploaded artwork layer (one clean asset-resolution
+// system; the SVG functions above become the FALLBACK for any asset here,
+// never a competing/duplicate system — see renderX() helpers below).
+// =============================================================================
+// Monster theme name -> its Emberfall location (mirrors the backend's
+// EMBERFALL_MONSTER_THEME table) — used to give NORMAL encounters a
+// subtle location-appropriate backdrop too, not just the boss.
+const MONSTER_LOCATION = {
+  "Ember Slime": "Ashen Gate",
+  "Ash Goblin": "Cinder Road",
+  "Cinder Skeleton": "Ember Ruins",
+  "Flame Orc": "Fallen Shrine",
+  "Ash Demon": "Iron Bastion",
+  "The Ashen Guardian": "Ashen Guardian",
+};
+
+const RPG_ASSETS = {
+  world: {
+    world_map: "/static/rpg/world/five_realms_world_map.jpg",
+    emberfall_journey_map: "/static/rpg/world/emberfall_journey_map.jpg",
+  },
+  ranks: {
+    Novice: "/static/rpg/ranks/novice.png",
+    Fighter: "/static/rpg/ranks/fighter.png",
+    Warrior: "/static/rpg/ranks/warrior.png",
+    Elite: "/static/rpg/ranks/elite.png",
+    Master: "/static/rpg/ranks/master.png",
+    Legend: "/static/rpg/ranks/legend.png",
+  },
+  monsters: {
+    "Ember Slime": "/static/rpg/monsters/ember_slime.png",
+    "Ash Goblin": "/static/rpg/monsters/ash_goblin.png",
+    "Cinder Skeleton": "/static/rpg/monsters/cinder_skeleton.jpg",
+    "Flame Orc": "/static/rpg/monsters/flame_orc.jpg",
+    "Ash Demon": "/static/rpg/monsters/ash_demon.jpg",
+    "The Ashen Guardian": "/static/rpg/monsters/ashen_guardian.jpg",
+  },
+  locations: {
+    "Ashen Gate": "/static/rpg/locations/ashen_gate.jpg",
+    "Cinder Road": "/static/rpg/locations/cinder_road.jpg",
+    "Ember Ruins": "/static/rpg/locations/ember_ruins.jpg",
+    "Fallen Shrine": "/static/rpg/locations/fallen_shrine.jpg",
+    "Iron Bastion": "/static/rpg/locations/iron_bastion.jpg",
+    "Ashen Guardian": "/static/rpg/locations/ashen_guardian_arena.jpg",
+  },
+  // All 6 chest-armor tiers have their own icon art (used for the small
+  // "equipment reward" contexts — realm-complete modal, armor-upgrade
+  // modal, equipment chips). The CHARACTER display uses the full
+  // pre-composited character-with-armor-and-shield renders instead (see
+  // CHARACTER_BY_CHEST_TIER below), which is the better source now that
+  // real shield-bearing art exists for every tier.
+  equipment: {
+    "Worn Emberplate": "/static/rpg/equipment/worn_emberplate.png",
+    "Ashwood Chestplate": "/static/rpg/equipment/ashwood_chestplate.png",
+    "Cinder Ironplate": "/static/rpg/equipment/cinder_ironplate.png",
+    "Embergold Chestplate": "/static/rpg/equipment/embergold_chestplate.png",
+    "Obsidian Flameplate": "/static/rpg/equipment/obsidian_flameplate.png",
+    "Legendary Emberplate": "/static/rpg/equipment/legendary_emberplate.png",
+  },
+  character: "/static/rpg/characters/base_character.png",
+};
+
+// Pre-composited "character actually wearing this chest tier + shield"
+// renders — real supplied art (not a guessed CSS overlay position),
+// keyed by the exact armor_name string the backend already returns as
+// current_armor. All 6 tiers now show a real, distinct shield:
+//   Worn / Ashwood: from the original armor-render batch (shield was
+//     already present in those two).
+//   Cinder / Embergold / Obsidian / Legendary: from a follow-up shield
+//     sheet, mapped to tiers by theme (Embergold's shield is literally
+//     gold; Legendary's is the most ornate; Obsidian's is the only
+//     dark/black-based palette of the set; Cinder got the simplest
+//     ember-red design). This mapping was a judgment call, not something
+//     labeled tier-by-tier in the source — flagged clearly so it's easy
+//     to correct if any pairing should swap.
+// Real (armor, shield) pairs across the full progression — as of the
+// V1.12 correction, chest armor and shield now share the EXACT SAME
+// 7-tier boundaries (0-999/1000-2499/2500-4499/4500-6499/6500-8499/
+// 8500-9999/10000+), so they always change together, at the same
+// instant. The earlier mismatch risk (Legendary armor showing before
+// Legendary shield was earned) can no longer happen by construction —
+// there is no gap-fallback logic needed anymore.
+//   0–999      No Chest Armor      + Base Shield       -> base_character.png
+//   1000–2499  Worn Emberplate     + Worn Shield        -> worn_emberplate.jpg
+//   2500–4499  Ashwood Chestplate  + Ashwood Shield      -> ashwood_chestplate.jpg
+//   4500–6499  Cinder Ironplate    + Cinder Shield       -> cinder_ironplate.jpg
+//   6500–8499  Embergold Chestplate + Embergold Shield   -> embergold_chestplate.jpg
+//   8500–9999  Obsidian Flameplate + Obsidian Shield     -> obsidian_flameplate.jpg
+//   10000+     Legendary Emberplate + Legendary Shield   -> legendary_emberplate.jpg
+//
+// HONESTY NOTE (unchanged from before): the shield actually pictured in
+// each of these 6 renders was never individually verified/labeled as
+// "this is tier X's shield" — the ARMOR match is confirmed (filenames
+// name the correct armor), the shield in-frame is the best available,
+// not a verified tier-accurate match. For 0-999 reps there is no armor
+// OR shield art at all — base_character.png is the plain unarmored
+// render with no shield depicted; that's a known, documented gap, not
+// something faked with CSS.
+const CHARACTER_BY_CHEST_TIER = {
+  "Worn Emberplate": "/static/rpg/characters/worn_emberplate.jpg",
+  "Ashwood Chestplate": "/static/rpg/characters/ashwood_chestplate.jpg",
+  "Cinder Ironplate": "/static/rpg/characters/cinder_ironplate.jpg",
+  "Embergold Chestplate": "/static/rpg/characters/embergold_chestplate.jpg",
+  "Obsidian Flameplate": "/static/rpg/characters/obsidian_flameplate.jpg",
+  "Legendary Emberplate": "/static/rpg/characters/legendary_emberplate.jpg",
+  // "No Chest Armor" (0-999 reps) intentionally has no entry here — falls
+  // through to RPG_ASSETS.character (base_character.png) in the renderer
+  // below, which is exactly correct: no armor equipped yet.
+};
+
+const SHIELD_TIER_ASSETS = {};
+
+const SHIELD_TIER_LADDER = [
+  { name: "Base Shield", min: 0 },
+  { name: "Worn Shield", min: 1000 },
+  { name: "Ashwood Shield", min: 2500 },
+  { name: "Cinder Shield", min: 4500 },
+  { name: "Embergold Shield", min: 6500 },
+  { name: "Obsidian Shield", min: 8500 },
+  { name: "Legendary Shield", min: 10000 },
+];
+
+// A missing/failed image must never crash the RPG page — every render
+// helper below emits an <img> with onerror swapping to the existing SVG
+// fallback already built (rankBadgeSvg / monsterSilhouetteSvg / etc.),
+// never emoji, per spec.
+function renderRankBadge(rank, size = 56) {
+  const url = RPG_ASSETS.ranks[rank];
+  const fallback = rankBadgeSvg(rank, size).replace(/"/g, "&quot;");
+  if (!url) return rankBadgeSvg(rank, size);
+  return `<img src="${url}" alt="${rank} badge" loading="lazy" style="width:${size}px;height:${size}px;object-fit:contain"
+    onerror="this.outerHTML='${fallback}'">`;
+}
+
+function renderMonsterArt(themeName, difficulty, isBoss, size = 120) {
+  const url = RPG_ASSETS.monsters[themeName];
+  const fallback = monsterSilhouetteSvg(difficulty, isBoss, size).replace(/"/g, "&quot;");
+  if (!url) return monsterSilhouetteSvg(difficulty, isBoss, size);
+  return `<img src="${url}" alt="${escapeHtml(themeName)}" loading="lazy" style="width:${size}px;height:${size}px;object-fit:contain"
+    onerror="this.outerHTML='${fallback}'">`;
+}
+
+function renderEquipmentArt(armorName, acquired, size = 96) {
+  const url = RPG_ASSETS.equipment[armorName];
+  const fallback = equipmentIconSvg("chest", acquired, size).replace(/"/g, "&quot;");
+  if (!url) return equipmentIconSvg("chest", acquired, size);
+  return `<img src="${url}" alt="${escapeHtml(armorName)}" loading="lazy" style="width:${size}px;height:${size}px;object-fit:contain"
+    onerror="this.outerHTML='${fallback}'">`;
+}
+
+function renderPlayerCharacter(size = 140) {
+  return `<img src="${RPG_ASSETS.character}" alt="Your character" loading="lazy" style="width:${size}px;height:auto;object-fit:contain"
+    onerror="this.style.display='none'">`;
+}
+
+// Renders the character wearing their ACTUAL current chest tier — reads
+// profile.current_armor (the same server-computed field already shown as
+// text everywhere else). At 0-999 reps current_armor is "No Chest Armor"
+// (not in CHARACTER_BY_CHEST_TIER), which correctly falls through to the
+// plain base character render — never Worn Emberplate this early. This
+// is the ONE reusable character renderer — Home, RPG Home, World Map,
+// Profile, and Public Profile all call this same function; nothing
+// hardcodes a character implementation per-screen.
+function renderEquippedCharacter(profile, size = 140) {
+  const armorName = profile && profile.current_armor;
+  const url = armorName && CHARACTER_BY_CHEST_TIER[armorName];
+  const finalUrl = url || RPG_ASSETS.character; // "No Chest Armor" / unknown tier -> base character, never broken
+  return `<img src="${finalUrl}" alt="Your character${url ? ' wearing ' + armorName : ''}" loading="lazy"
+    style="width:${size}px;height:auto;object-fit:contain;display:block;"
+    onerror="this.src='${RPG_ASSETS.character}';this.onerror=null;">`;
+}
+
+// Compact text ladder for shield progression (Feature 5) — current tier
+// highlighted, future tiers muted, each showing its real required reps.
+// No image per tier (see SHIELD_TIER_ASSETS note) — this is honest text,
+// not a fabricated visual.
+function renderShieldTierLadder(currentShieldName, embersProgress) {
+  const rows = SHIELD_TIER_LADDER.map((tier, i) => {
+    const isCurrent = tier.name === currentShieldName;
+    const isPast = !isCurrent && embersProgress >= tier.min && SHIELD_TIER_LADDER.findIndex(t => t.name === currentShieldName) > i;
+    const cls = isCurrent ? "shieldTierRow shieldTierCurrent" : isPast ? "shieldTierRow shieldTierPast" : "shieldTierRow shieldTierLocked";
+    return `<div class="${cls}">
+      <span class="shieldTierName">${isCurrent ? "→ " : isPast ? "✓ " : ""}${escapeHtml(tier.name)}</span>
+      <span class="hint">${tier.min.toLocaleString()}+ reps</span>
+    </div>`;
+  });
+  return `<div id="shieldTierLadder">${rows.join("")}</div>`;
+}
+
+function renderLocationBackdrop(locationName) {
+  const url = RPG_ASSETS.locations[locationName];
+  // background-size/position set explicitly here too (belt-and-suspenders
+  // with the .rpgMapNode base rule) — this is exactly the pair of
+  // properties a `background:` SHORTHAND elsewhere could silently reset;
+  // setting them inline makes that class of bug impossible regardless of
+  // what other CSS rules are added later.
+  return url ? `background-image:url('${url}');background-size:cover;background-position:center;background-repeat:no-repeat;` : "";
+}
+
+// ---------------------------------------------------------------- World Map
+const REALM_ICONS = { emberfall: "🔥", thornveil: "🌿", stoneheart: "🪨", ironreach: "⚔️", stormspire: "⚡" };
+const EQUIPMENT_SLOT_ICONS = { chest: "🛡", legs: "🦵", core: "🧱", power: "⚡", shoulders: "🛡" };
+const EQUIPMENT_SLOT_LABELS = { chest: "Chest", legs: "Legs", core: "Core", power: "Power", shoulders: "Shoulders" };
+
+// Approximate hotspot positions (% of the map image's width/height),
+// eyeballed against the actual uploaded five_realms_world_map.jpg
+// artwork's five visible regions — forest (Thornveil), grey stone peaks
+// (Stoneheart), the fortress (Ironreach), the storm citadel (Stormspire),
+// and the volcanic peak (Emberfall). Purely presentational coordinates;
+// realm identity/status/locking all still come from the real API data.
+// Marker anchor points (label/emblem position) — same as before.
+const REALM_HOTSPOTS = {
+  thornveil:  { left: 14, top: 42 },
+  stoneheart: { left: 45, top: 22 },
+  ironreach:  { left: 80, top: 50 },
+  stormspire: { left: 80, top: 12 },
+  emberfall:  { left: 50, top: 78 },
+};
+// Territory glow extents (% of map width/height) — eyeballed against the
+// actual artwork's visible regions. NOT precise geographic borders (the
+// source is a single raster painting with no real vector boundaries) —
+// a soft, visually-believable glow footprint over each region, per the
+// "don't pretend real boundaries exist" note.
+const REALM_TERRITORIES = {
+  thornveil:  { left: 14, top: 40, width: 34, height: 46 },
+  stoneheart: { left: 45, top: 20, width: 30, height: 40 },
+  ironreach:  { left: 80, top: 48, width: 34, height: 44 },
+  stormspire: { left: 80, top: 12, width: 34, height: 36 },
+  emberfall:  { left: 50, top: 76, width: 40, height: 42 },
+};
+
+async function loadRpgWorld() {
   try {
-    const [profile, monsters, current] = await Promise.all([
-      api("/rpg/profile"), api("/rpg/monsters"), api("/rpg/encounters/current"),
+    const [world, profile] = await Promise.all([api("/rpg/world"), api("/rpg/profile")]);
+    rpgProfileCache = profile;
+    renderRpgCharacterStrip(profile);
+
+    const layer = document.getElementById("rpgWorldMapHotspots");
+    layer.innerHTML = "";
+    const markers = [];
+    world.realms.forEach(r => {
+      const pos = REALM_HOTSPOTS[r.code];
+      const territory = REALM_TERRITORIES[r.code];
+      if (!pos) return;
+      const stateClass = r.status === "completed" ? "realmHotspotCompleted"
+        : r.status === "locked" ? "realmHotspotLocked" : "realmHotspotAvailable";
+      const marker = document.createElement("button");
+      marker.type = "button";
+      marker.className = `realmHotspot ${stateClass}`;
+      marker.style.left = `${pos.left}%`;
+      marker.style.top = `${pos.top}%`;
+      if (territory) {
+        // Territory glow is a sibling behind the marker, sized/positioned
+        // over the realm's visible region — revealed on hover via CSS,
+        // kept as a persistent low glow for the current (available) realm.
+        marker.style.setProperty("--territory-left", `${territory.left}%`);
+        marker.style.setProperty("--territory-top", `${territory.top}%`);
+        marker.style.setProperty("--territory-width", `${territory.width}%`);
+        marker.style.setProperty("--territory-height", `${territory.height}%`);
+      }
+      marker.setAttribute("aria-label", `${r.display_name} — ${r.status === "locked" ? "coming soon" : r.status === "completed" ? "reclaimed" : "you are here"}`);
+      const stateIcon = r.status === "completed" ? "✓" : r.status === "locked" ? "🔒" : "📍";
+      marker.innerHTML = `
+        <span class="realmHotspotTerritory" aria-hidden="true"></span>
+        <span class="realmHotspotEmblem">${realmEmblemSvg(r.code, 40)}</span>
+        <span class="realmHotspotState">${stateIcon}</span>
+        <span class="realmHotspotLabel">${escapeHtml(r.display_name)}</span>
+      `;
+      marker.addEventListener("click", () => openRealm(r));
+      // Hovering one realm dims the others slightly — makes the hovered
+      // territory feel like it's being "selected" out of the whole map.
+      marker.addEventListener("mouseenter", () => {
+        markers.forEach(m => { if (m !== marker) m.classList.add("realmHotspotDimmed"); });
+      });
+      marker.addEventListener("mouseleave", () => {
+        markers.forEach(m => m.classList.remove("realmHotspotDimmed"));
+      });
+      markers.push(marker);
+      layer.appendChild(marker);
+    });
+  } catch (e) { /* best effort */ }
+}
+
+function exerciseLabel(exerciseType) {
+  return ({ push_up: "Push-up", lunge: "Lunge", plank: "Plank", squat: "Squat", shoulder_press: "Shoulder Exercise" })[exerciseType] || exerciseType;
+}
+
+// Deliberately NOT a labeled "Chest / Legs / Core / Power / Shoulders" row
+// — that read as a fitness-dashboard body-part selector rather than an
+// RPG. The world map only ever shows a single fragment count; the
+// per-slot breakdown (with body-part names) lives on the Profile screen
+// instead, where it's expected context rather than primary navigation.
+function renderRpgCharacterStrip(profile) {
+  const acquired = profile.equipment ? Object.keys(profile.equipment).length : 0;
+  document.getElementById("rpgCharacterFragments").textContent = `${acquired} / 5 Fragments Reclaimed`;
+  document.getElementById("rpgCharacterLevelLine").textContent = `Level ${profile.rpg_level} · ${profile.rpg_rank}`;
+  document.getElementById("rpgCharacterEmoji").innerHTML = equipmentIconSvg("chest", acquired > 0, 30);
+  document.getElementById("rpgCharacterBadge").innerHTML = renderRankBadge(profile.rpg_rank, 40);
+  document.getElementById("rpgCharacterPortrait").innerHTML = renderEquippedCharacter(profile, 72);
+}
+
+function openRealm(realm) {
+  if (realm.status === "locked") {
+    showRealmLockedModal(realm);
+    return;
+  }
+  document.getElementById("rpgHomeRealmEmblem").innerHTML = realmEmblemSvg(realm.code, 32);
+  document.getElementById("rpgHomeRealmTitle").textContent = realm.display_name.toUpperCase();
+  document.getElementById("rpgHomeRealmSubtitle").textContent = realm.subtitle;
+  loadRpgHome(realm.code);
+  showScreen("rpgHome");
+}
+
+function showRealmLockedModal(realm) {
+  document.getElementById("realmLockedEmblem").innerHTML = realmEmblemSvg(realm.code, 48);
+  document.getElementById("realmLockedName").textContent = realm.display_name;
+  document.getElementById("realmLockedExercise").textContent = exerciseLabel(realm.exercise_type).toUpperCase();
+  document.getElementById("realmLockedModal").classList.remove("hidden");
+}
+document.getElementById("realmLockedCloseBtn").addEventListener("click", () => {
+  document.getElementById("realmLockedModal").classList.add("hidden");
+});
+
+function showRealmCompleteModal(info, realmsCompleted, realmsTotal) {
+  document.getElementById("realmCompleteRewardIcon").innerHTML = renderEquipmentArt(info.reward_name, true, 96);
+  document.getElementById("realmCompleteName").textContent = `${info.realm_display_name.toUpperCase()} DEFEATED`;
+  document.getElementById("realmCompleteRewardName").textContent = `${info.reward_name.toUpperCase()} ACQUIRED`;
+  document.getElementById("realmCompleteCounter").textContent = `REALMS: ${realmsCompleted} / ${realmsTotal}`;
+  document.getElementById("realmCompleteModal").classList.remove("hidden");
+  spawnEmberParticles(document.getElementById("realmCompleteRewardIcon"), 14);
+  playBeep(1318, 0.25);
+}
+document.getElementById("realmCompleteCloseBtn").addEventListener("click", () => {
+  document.getElementById("realmCompleteModal").classList.add("hidden");
+});
+
+document.getElementById("shieldLadderToggleBtn").addEventListener("click", () => {
+  document.getElementById("shieldLadderWrap").classList.toggle("hidden");
+});
+
+let rpgProfileCache = null;
+let rpgCurrentRealmCode = "emberfall"; // only playable realm in V1 — kept as a variable, not hardcoded inline, so this generalizes cleanly once more realms ship
+let rpgPendingArmorUpgrade = null; // set by any /hit response that crossed a milestone; shown next time loadRpgHome() runs
+let rpgPendingShieldUpgrade = null;
+let rpgPendingRealmCompleted = null;
+
+// Spawns a small burst of ember-spark particles inside `container` (which
+// must be position:relative/inset for them to radiate from center) —
+// pure CSS-driven (see .emberParticle keyframes), removed automatically
+// after their animation ends so they never pile up across repeated
+// celebrations.
+function spawnEmberParticles(container, count = 10) {
+  if (!container) return;
+  for (let i = 0; i < count; i++) {
+    const p = document.createElement("span");
+    p.className = "emberParticle";
+    const angle = (360 / count) * i + (Math.random() * 20 - 10);
+    const dist = 40 + Math.random() * 30;
+    p.style.setProperty("--particle-angle", `${angle}deg`);
+    p.style.setProperty("--particle-dist", `${dist}px`);
+    p.style.setProperty("--particle-delay", `${Math.random() * 0.15}s`);
+    container.appendChild(p);
+    p.addEventListener("animationend", () => p.remove());
+  }
+}
+
+// Tier "intensity" — used purely to scale the celebration (particle count
+// / glow strength), each tier progressively more impressive, per spec.
+const EQUIPMENT_TIER_INTENSITY = {
+  "Worn Emberplate": 1, "Ashwood Chestplate": 2, "Cinder Ironplate": 3,
+  "Embergold Chestplate": 4, "Obsidian Flameplate": 5, "Legendary Emberplate": 6,
+};
+
+// The combined "NEW EQUIPMENT" reveal — armor chest AND shield now change
+// together (synchronized boundaries), so this shows both at once with the
+// character actually wearing the new tier, rather than two separate
+// modals for the same moment.
+function showNewEquipmentModal(armorInfo, shieldInfo, profileAfter) {
+  const box = document.getElementById("armorUpgradeModalBox");
+  const isLegendary = shieldInfo && shieldInfo.shield_name === "Legendary Shield";
+  box.classList.toggle("legendaryMoment", isLegendary);
+  document.getElementById("armorUpgradeKicker").textContent = isLegendary ? "LEGENDARY SHIELD UNLOCKED" : "NEW EQUIPMENT";
+
+  const charWrap = document.getElementById("armorUpgradeCharacterWrap");
+  charWrap.innerHTML = renderEquippedCharacter(profileAfter, 130);
+  const charImg = charWrap.querySelector("img");
+  if (charImg) charImg.classList.add("equipmentRevealChar");
+
+  document.getElementById("armorUpgradeArt").innerHTML = "";
+  document.getElementById("armorUpgradeName").textContent = armorInfo ? armorInfo.armor_name.toUpperCase() : "";
+  document.getElementById("armorUpgradeShieldName").textContent = shieldInfo ? shieldInfo.shield_name.toUpperCase() : "";
+  document.getElementById("armorUpgradeReps").textContent = isLegendary
+    ? "10,000 EMBERFALL REPS"
+    : `${(armorInfo || shieldInfo).reps_reclaimed.toLocaleString()} reps reclaimed`;
+  document.getElementById("armorUpgradeModal").classList.remove("hidden");
+
+  const intensity = EQUIPMENT_TIER_INTENSITY[armorInfo && armorInfo.armor_name] || 3;
+  spawnEmberParticles(charWrap, isLegendary ? 18 : 4 + intensity * 2);
+  playBeep(isLegendary ? 1318 : 700 + intensity * 60, isLegendary ? 0.25 : 0.12 + intensity * 0.015);
+}
+document.getElementById("armorUpgradeCloseBtn").addEventListener("click", () => {
+  document.getElementById("armorUpgradeModal").classList.add("hidden");
+  document.getElementById("armorUpgradeModalBox").classList.remove("legendaryMoment");
+  if (rpgPendingRealmCompleted) {
+    const info = rpgPendingRealmCompleted;
+    rpgPendingRealmCompleted = null;
+    rpgProfileCache && showRealmCompleteModal(info, rpgProfileCache.realms_completed, rpgProfileCache.realms_total);
+  }
+});
+
+async function loadRpgHome(realmCode) {
+  if (realmCode) rpgCurrentRealmCode = realmCode;
+  try {
+    const [profile, realm, current] = await Promise.all([
+      api("/rpg/profile"), api(`/rpg/realm/${rpgCurrentRealmCode}`), api("/rpg/encounters/current"),
     ]);
     rpgProfileCache = profile;
     renderRpgHeader(profile);
+
+    // Show any armor/shield upgrade / realm completion earned during the
+    // just-finished battle — now that we're safely back on RPG home, not
+    // mid-camera-exercise. Armor+shield now change TOGETHER (synchronized
+    // boundaries), so they're shown as ONE combined reveal, then realm
+    // completion (if any) follows.
+    if (rpgPendingArmorUpgrade || rpgPendingShieldUpgrade) {
+      const armorInfo = rpgPendingArmorUpgrade;
+      const shieldInfo = rpgPendingShieldUpgrade;
+      rpgPendingArmorUpgrade = null;
+      rpgPendingShieldUpgrade = null;
+      showNewEquipmentModal(armorInfo, shieldInfo, profile);
+    } else if (rpgPendingRealmCompleted) {
+      const info = rpgPendingRealmCompleted;
+      rpgPendingRealmCompleted = null;
+      showRealmCompleteModal(info, profile.realms_completed, profile.realms_total);
+    }
+
+    document.getElementById("rpgHomeRealmFlavor").textContent = realm.theme;
+    document.getElementById("rpgRealmProgressPct").textContent = `${realm.progress_pct}% Reclaimed`;
+    document.getElementById("rpgRealmProgressFill").style.width = `${realm.progress_pct}%`;
+    document.getElementById("rpgRealmProgressReps").textContent =
+      `${realm.progress_value.toLocaleString()} / ${realm.progress_total.toLocaleString()} reps reclaimed`;
+    document.getElementById("rpgCurrentArmorArt").innerHTML = renderEquipmentArt(realm.current_armor, true, 64);
+    document.getElementById("rpgCurrentArmorName").textContent = realm.current_armor;
+    document.getElementById("rpgCurrentShieldName").textContent = profile.current_shield;
+    document.getElementById("shieldLadderWrap").innerHTML = renderShieldTierLadder(profile.current_shield, realm.progress_value);
 
     const continueBox = document.getElementById("rpgContinueBattleBox");
     if (current.active) {
       continueBox.classList.remove("hidden");
       continueBox.innerHTML = `
-        <div class="monsterCardIcon">${current.monster_icon}</div>
+        <div class="monsterCardIcon">${renderMonsterArt(current.monster_theme_name || current.monster_name, current.monster_difficulty, current.monster_is_boss, 34)}</div>
         <div>
-          <div class="monsterCardName">${current.monster_name}</div>
+          <div class="monsterCardName">${escapeHtml(current.monster_theme_name || current.monster_name)}</div>
           <div class="hint">${current.monster_hp} / ${current.monster_max_hp} HP remaining</div>
         </div>
         <button id="rpgContinueBattleBtn">CONTINUE BATTLE</button>
         <button id="rpgChangeMonsterBtn" class="secondary">CHANGE MONSTER</button>
       `;
       document.getElementById("rpgContinueBattleBtn").addEventListener("click", () => {
-        enterRpgBattle(current.encounter_id, current.monster_name, current.monster_icon,
-          current.monster_hp, current.monster_max_hp);
+        enterRpgBattle(current.encounter_id, current.monster_theme_name || current.monster_name,
+          current.monster_difficulty, current.monster_is_boss, current.monster_hp, current.monster_max_hp);
       });
       document.getElementById("rpgChangeMonsterBtn").addEventListener("click", async () => {
         const ok = confirm("Abandon current battle and choose another monster? You will not receive XP or Gold for it.");
@@ -2195,24 +3582,86 @@ async function loadRpgHome() {
       continueBox.classList.add("hidden");
     }
 
-    const grid = document.getElementById("monsterGrid");
-    grid.innerHTML = "";
-    monsters.forEach(m => {
-      const card = document.createElement("div");
-      card.className = "monsterCard";
-      card.innerHTML = `
-        <div class="monsterCardIcon">${m.icon}</div>
-        <div class="monsterCardName">${m.name}</div>
-        <div class="hint">${m.max_hp} HP · +${m.xp_reward} XP · +${m.gold_reward} Gold</div>
-        <button class="monsterBattleBtn" data-id="${m.id}">BATTLE</button>
-      `;
-      card.querySelector(".monsterBattleBtn").addEventListener("click", () => startRpgBattle(m.id));
-      grid.appendChild(card);
-    });
+    renderRpgLocalMap(realm.locations, realm.monsters, realm.progress_value);
   } catch (e) { /* best effort */ }
 }
 
+// The local journey map — connected location nodes standing in for the
+// old flat "pick any monster" grid. Battling is unchanged (same
+// startRpgBattle(monsterId) call, same existing encounter/combat system);
+// this only changes how the choice is PRESENTED, matching each location
+// 1:1 with the existing monster roster in the same fixed order.
+const LOCATION_STATUS_ICON = { completed: "✓", current: "→", upcoming: "🔒" };
+
+function renderRpgLocalMap(locations, monsters, progressValue) {
+  const monsterById = {};
+  monsters.forEach(m => { monsterById[m.id] = m; });
+
+  const track = document.getElementById("rpgLocalMap");
+  track.innerHTML = "";
+  locations.forEach((loc, i) => {
+    const m = monsterById[loc.monster_id];
+    const node = document.createElement("div");
+    node.className = `rpgMapNode rpgMapNode-${loc.status}` + (loc.is_boss ? " rpgMapNodeBoss" : "");
+    const backdropStyle = renderLocationBackdrop(loc.location_name);
+    if (backdropStyle) node.style.cssText += backdropStyle;
+
+    // Exact progress toward THIS location's unlock, using the existing
+    // reps_min/reps_max the realm API already returns — no new/invented
+    // progression math, just reading the real milestone boundaries.
+    let progressHtml = "";
+    if (loc.status === "upcoming") {
+      const repsRemaining = Math.max(0, loc.reps_min - progressValue);
+      const pct = Math.min(100, Math.round(100 * progressValue / loc.reps_min));
+      progressHtml = `
+        <div class="rpgMapNodeReq">Requires ${loc.reps_min.toLocaleString()} reps</div>
+        <div class="rpgMapNodeProgressTrack"><div class="rpgMapNodeProgressFill" style="width:${pct}%"></div></div>
+        <div class="hint">${repsRemaining.toLocaleString()} reps remaining</div>
+      `;
+    } else if (loc.status === "current" && i < locations.length - 1) {
+      const next = locations[i + 1];
+      const span = next.reps_min - loc.reps_min;
+      const pct = span > 0 ? Math.min(100, Math.round(100 * (progressValue - loc.reps_min) / span)) : 100;
+      const repsUntilNext = Math.max(0, next.reps_min - progressValue);
+      progressHtml = `
+        <div class="rpgMapNodeReq">Progress toward ${escapeHtml(next.location_name)}</div>
+        <div class="rpgMapNodeProgressTrack"><div class="rpgMapNodeProgressFill" style="width:${pct}%"></div></div>
+        <div class="hint">${repsUntilNext.toLocaleString()} reps until ${escapeHtml(next.location_name)}</div>
+      `;
+    }
+
+    // Locked-location UX: an upcoming location does NOT get a misleading
+    // BATTLE button — presentational only, the underlying /encounters/start
+    // endpoint still allows any order, this just guides the player clearly.
+    const actionHtml = loc.status === "upcoming"
+      ? `<div class="rpgMapNodeLockedNote">Complete the previous encounter to unlock.</div>`
+      : `<button class="monsterBattleBtn" data-id="${loc.monster_id}">${loc.status === "completed" ? "BATTLE AGAIN" : "BATTLE"}</button>`;
+    node.innerHTML = `
+      <div class="rpgMapNodeOverlay">
+        <div class="rpgMapNodeStatus">${LOCATION_STATUS_ICON[loc.status]}</div>
+        <div class="rpgMapNodeIcon">${locationMarkerSvg(loc.location_name, loc.is_boss, loc.is_boss ? 52 : 40)}</div>
+        <div class="rpgMapNodeName">${escapeHtml(loc.location_name)}</div>
+        ${loc.is_boss ? '<div class="monsterBossTag">REALM BOSS</div>' : ""}
+        ${m ? `<div class="hint">${m.max_hp} HP · +${m.xp_reward} XP · +${m.gold_reward} Gold</div>` : ""}
+        ${progressHtml}
+        ${actionHtml}
+      </div>
+    `;
+    if (loc.status !== "upcoming") {
+      node.querySelector(".monsterBattleBtn").addEventListener("click", () => startRpgBattle(loc.monster_id));
+    }
+    track.appendChild(node);
+    if (i < locations.length - 1) {
+      const connector = document.createElement("div");
+      connector.className = "rpgMapConnector";
+      track.appendChild(connector);
+    }
+  });
+}
+
 function renderRpgHeader(profile) {
+  document.getElementById("rpgHomeCharacterPortrait").innerHTML = renderEquippedCharacter(profile, 56);
+  document.getElementById("rpgHeaderBadge").innerHTML = renderRankBadge(profile.rpg_rank, 44);
   document.getElementById("rpgLevelValue").textContent = profile.rpg_level;
   document.getElementById("rpgRankValue").textContent = profile.rpg_rank;
   document.getElementById("rpgGoldValue").textContent = profile.gold;
@@ -2229,8 +3678,8 @@ async function resumeRpgBattleIfAny() {
   try {
     const current = await api("/rpg/encounters/current");
     if (!current.active) return false;
-    enterRpgBattle(current.encounter_id, current.monster_name, current.monster_icon,
-      current.monster_hp, current.monster_max_hp);
+    enterRpgBattle(current.encounter_id, current.monster_theme_name || current.monster_name,
+      current.monster_difficulty, current.monster_is_boss, current.monster_hp, current.monster_max_hp);
     return true;
   } catch (e) {
     return false;
@@ -2245,12 +3694,27 @@ let rpgMonsterHp = 0;
 let rpgMonsterMaxHp = 0;
 
 async function startRpgBattle(monsterId) {
+  // V1.14: RPG now shows its OWN dedicated onboarding (game loop +
+  // camera basics) on first RPG entry — separate flag from the PvP
+  // explainer, so a player who already dismissed the PvP one still sees
+  // this once, and vice versa.
+  if (!hasSeenRpgIntro()) {
+    pendingRpgBattleStart = monsterId;
+    showRpgIntroModal();
+    return;
+  }
+  await _startRpgBattleAfterIntro(monsterId);
+}
+
+let pendingRpgBattleStart = null;
+
+async function _startRpgBattleAfterIntro(monsterId) {
   try {
     const res = await api("/rpg/encounters/start", { method: "POST", body: JSON.stringify({ monster_id: monsterId }) });
     const monsters = await api("/rpg/monsters");
     const monster = monsters.find(m => m.id === monsterId);
     rpgLevelBeforeBattle = rpgProfileCache ? rpgProfileCache.rpg_level : 1;
-    enterRpgBattle(res.encounter_id, monster.name, monster.icon, res.monster_hp, res.monster_hp);
+    enterRpgBattle(res.encounter_id, monster.theme_name || monster.name, monster.difficulty, monster.is_boss, res.monster_hp, res.monster_hp);
   } catch (e) {
     if (e.message && e.message.includes("already have an active encounter")) {
       // Resume instead of failing — the user likely double-clicked or
@@ -2267,15 +3731,50 @@ async function startRpgBattle(monsterId) {
 // "time up" state. A battle simply runs until the monster is defeated or
 // the player leaves (Leave Battle just navigates away; the encounter
 // itself stays active server-side and is fully resumable later).
-function enterRpgBattle(encounterId, monsterName, monsterIcon, monsterHp, monsterMaxHp) {
+function enterRpgBattle(encounterId, monsterName, difficulty, isBoss, monsterHp, monsterMaxHp) {
   rpgEncounterId = encounterId;
   rpgRepCount = 0;
   rpgMonsterHp = monsterHp;
   rpgMonsterMaxHp = monsterMaxHp;
+  rpgIsBossBattle = isBoss;
   document.getElementById("battleMonsterName").textContent = monsterName;
-  document.getElementById("battleMonsterIcon").textContent = monsterIcon;
+  document.getElementById("battleMonsterIcon").innerHTML = renderMonsterArt(monsterName, difficulty, isBoss, isBoss ? 90 : 130);
   document.getElementById("rpgRepCount").textContent = "0";
   updateMonsterHpBar();
+
+  // Boss presentation — Ashen Guardian gets the dedicated arena backdrop,
+  // a larger/dramatic HP bar treatment, and a brief entrance flash, so
+  // it's unmistakably a different kind of encounter. NORMAL fights
+  // (Slime, Goblin, etc.) now ALSO get a location-appropriate backdrop
+  // (Ashen Gate for Slime, Cinder Road for Goblin, ...) — same mechanism,
+  // much subtler opacity and no dark-flash intro/boss label, so a normal
+  // fight still clearly reads as "normal," just no longer a flat empty
+  // panel behind the monster.
+  const screen = document.getElementById("rpgBattleScreen");
+  const arena = document.getElementById("rpgBattleArenaOverlay");
+  const bossLabel = document.getElementById("battleBossLabel");
+  screen.classList.toggle("bossEncounter", isBoss);
+  bossLabel.classList.toggle("hidden", !isBoss);
+  const locationName = MONSTER_LOCATION[monsterName];
+  const backdropUrl = locationName && RPG_ASSETS.locations[locationName];
+  if (isBoss) {
+    arena.style.backgroundImage = "url('/static/rpg/locations/ashen_guardian_arena.jpg')";
+    arena.classList.add("hasBackdrop");
+    const flash = document.getElementById("rpgBattleIntroFlash");
+    flash.classList.remove("hidden");
+    flash.classList.remove("rpgBossIntroPlay");
+    void flash.offsetWidth;
+    flash.classList.add("rpgBossIntroPlay");
+    playBeep(220, 0.3);
+    setTimeout(() => flash.classList.add("hidden"), 1300);
+  } else if (backdropUrl) {
+    arena.style.backgroundImage = `url('${backdropUrl}')`;
+    arena.classList.add("hasBackdrop");
+  } else {
+    arena.style.backgroundImage = "";
+    arena.classList.remove("hasBackdrop");
+  }
+
   showScreen("rpgBattle");
   ensureCameraSetupThenProceed(async () => {
     await startRpgCamera();
@@ -2283,6 +3782,7 @@ function enterRpgBattle(encounterId, monsterName, monsterIcon, monsterHp, monste
     requestAnimationFrame(rpgDetectionLoop);
   });
 }
+let rpgIsBossBattle = false;
 
 function updateMonsterHpBar() {
   const pct = rpgMonsterMaxHp > 0 ? Math.max(0, 100 * rpgMonsterHp / rpgMonsterMaxHp) : 0;
@@ -2314,6 +3814,8 @@ let rpgDetectionRunning = false;
 let rpgRepState = "up";
 let rpgDownShoulderY = null;
 let rpgDownBodyScale = null;
+let rpgDownShoulderYExtreme = 0; // SAME peak-tracking fix as PvP — see detectionLoop
+let lastRpgRepRejectedReason = null; // dev-debug only, mirrors lastPvpRepRejectedReason
 let rpgPendingDownFrames = 0;
 let rpgPendingUpFrames = 0;
 let rpgRepWasValidThroughout = true;
@@ -2329,6 +3831,7 @@ async function startRpgCamera() {
   const statusEl = document.getElementById("rpgCameraStatus");
   rpgRepState = "up";
   rpgDownShoulderY = null;
+  rpgDownShoulderYExtreme = 0;
   rpgDownBodyScale = null;
   rpgPendingDownFrames = 0;
   rpgPendingUpFrames = 0;
@@ -2337,6 +3840,7 @@ async function startRpgCamera() {
   rpgLastRepTimestamp = 0;
   rpgFlatZStreak = 0;
   rpgLivenessWarningShown = false;
+  resetPoseTracker(rpgPoseTracker);
   setRpgManualButtonEnabled(false);
 
   try {
@@ -2347,6 +3851,7 @@ async function startRpgCamera() {
     });
     video.srcObject = rpgCameraStream;
     await video.play();
+    setCameraActiveIndicator("rpgCameraActiveIndicator", true);
 
     statusEl.textContent = "🧠 Loading AI model…";
     const timeoutPromise = new Promise((_, reject) =>
@@ -2370,6 +3875,8 @@ function setRpgManualButtonEnabled(enabled) {
 
 function stopRpgCamera() {
   rpgDetectionRunning = false;
+  setCameraActiveIndicator("rpgCameraActiveIndicator", false);
+  hidePoseDebugOverlay("rpgPoseDebug");
   if (rpgCameraStream) {
     rpgCameraStream.getTracks().forEach(t => t.stop());
     rpgCameraStream = null;
@@ -2399,11 +3906,8 @@ function rpgDetectionLoop() {
 
     if (result.landmarks && result.landmarks.length > 0) {
       const lm = result.landmarks[0];
-      const leftVis = (lm[11]?.visibility || 0) + (lm[13]?.visibility || 0) + (lm[15]?.visibility || 0);
-      const rightVis = (lm[12]?.visibility || 0) + (lm[14]?.visibility || 0) + (lm[16]?.visibility || 0);
-      const useRight = rightVis >= leftVis;
-      const idx = useRight ? [12, 14, 16, 24, 26, 28] : [11, 13, 15, 23, 25, 27];
-      const [s, e, w, hip, knee, ankle] = idx.map(i => lm[i]);
+      const tracked = trackPoseLandmarks(rpgPoseTracker, lm, rpgRepState); // SAME shared tracker as PvP
+      const { shoulder: s, elbow: e, wrist: w, hip, knee, ankle } = tracked.points;
 
       if (s && e && w) {
         const toPx = p => ({ x: p.x * canvas.width, y: p.y * canvas.height });
@@ -2411,34 +3915,27 @@ function rpgDetectionLoop() {
         const shoulderPx = toPx(s);
         const hipPx = hip ? toPx(hip) : null;
 
-        ctx.strokeStyle = "#3ce8ff";
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.moveTo(toPx(s).x, toPx(s).y);
-        ctx.lineTo(toPx(e).x, toPx(e).y);
-        ctx.lineTo(toPx(w).x, toPx(w).y);
-        ctx.stroke();
-        [s, e, w].forEach(p => {
-          const px = toPx(p);
-          ctx.fillStyle = "#ff5a3c";
-          ctx.beginPath();
-          ctx.arc(px.x, px.y, 6, 0, 2 * Math.PI);
-          ctx.fill();
-        });
+        drawTrackedArm(ctx, toPx, s, e, w, rpgPoseTracker.heldThisFrame); // SAME shared drawing as PvP
 
         // SAME thresholds/structure as PvP's detectionLoop — RPG must not
         // require anything beyond what PvP requires.
         const coreVisible = [s, e, w, hip].every(p => (p?.visibility || 0) > CONFIG.MIN_LANDMARK_VISIBILITY);
         const bodyVisible = [knee, ankle].every(p => (p?.visibility || 0) > CONFIG.MIN_BODY_VISIBILITY);
         let goodAlignment = true;
-        if (hip && knee && coreVisible) {
-          const hipAngle = angleBetween(toPx(s), toPx(hip), toPx(knee));
-          goodAlignment = Math.abs(180 - hipAngle) < CONFIG.MAX_HIP_SAG_DEVIATION;
+        let hipDirection = null;
+        if (hip && ankle && bodyVisible) {
+          const { ratio, direction } = computeHipAlignment(shoulderPx, toPx(hip), toPx(ankle)); // SAME shared function as PvP
+          goodAlignment = ratio < CONFIG.MAX_HIP_DEVIATION_RATIO;
+          hipDirection = direction;
         }
 
         // SAME non-blocking liveness signal as PvP — never affects canCount.
+        // Uses RAW (pre-smoothing) landmarks — see PvP's detectionLoop for why.
         if (coreVisible) {
-          const zResult = checkLivenessSignal({ shoulder: s, elbow: e, wrist: w, hip, knee, ankle }, rpgFlatZStreak);
+          const rawIdx = POSE_SIDE_LANDMARKS[tracked.side];
+          const rawPts = { shoulder: lm[rawIdx.shoulder], elbow: lm[rawIdx.elbow], wrist: lm[rawIdx.wrist],
+                            hip: lm[rawIdx.hip], knee: lm[rawIdx.knee], ankle: lm[rawIdx.ankle] };
+          const zResult = checkLivenessSignal(rawPts, rpgFlatZStreak);
           rpgFlatZStreak = zResult.streak;
           if (zResult.shouldWarn && !rpgLivenessWarningShown) {
             rpgLivenessWarningShown = true;
@@ -2448,11 +3945,26 @@ function rpgDetectionLoop() {
 
         if (!coreVisible) setRpgFeedback("⚠️ Show your full body to the camera.");
         else if (!bodyVisible) setRpgFeedback("Stand sideways, full body in frame.");
-        else if (!goodAlignment) setRpgFeedback("Keep your body straight.");
+        else if (tracked.tracking === "unstable") setRpgFeedback("⚠️ Keep your side position — AI is re-locking your arm.");
+        else if (!goodAlignment) setRpgFeedback(hipDirection === "sag" ? "Move your hips slightly up." : "Lower your hips slightly.");
         else if (rpgRepState === "down") setRpgFeedback("Go deeper, extend your arms!");
         else setRpgFeedback("Good — keep going!");
 
-        const canCount = coreVisible && bodyVisible && goodAlignment;
+        // Section 14: never count off an unstable/held tracking frame.
+        const canCount = coreVisible && bodyVisible && goodAlignment && tracked.tracking === "stable";
+
+        // SAME peak-tracking fix as PvP — see detectionLoop for why.
+        if (rpgRepState === "down" && rpgDownShoulderY !== null) {
+          rpgDownShoulderYExtreme = Math.max(rpgDownShoulderYExtreme, Math.abs(shoulderPx.y - rpgDownShoulderY));
+        }
+
+        renderPoseDebugOverlay("rpgPoseDebug", tracked, angle, rpgRepState, {
+          shoulderMovement: rpgDownShoulderYExtreme,
+          movementThreshold: rpgDownBodyScale ? CONFIG.MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO * rpgDownBodyScale : CONFIG.MIN_SHOULDER_MOVEMENT_RATIO * canvas.height,
+          canvasHeight: canvas.height,
+          canCount, coreVisible, bodyVisible, goodAlignment, hipDirection,
+          lastRepRejectedReason: lastRpgRepRejectedReason,
+        });
 
         // SAME continuous-validity + debounce + body-scale-normalized
         // logic as PvP's detectionLoop — see the detailed comments there.
@@ -2472,6 +3984,7 @@ function rpgDetectionLoop() {
             rpgRepState = "down";
             rpgPendingDownFrames = 0;
             rpgDownShoulderY = shoulderPx.y;
+            rpgDownShoulderYExtreme = 0;
             rpgDownBodyScale = hipPx ? Math.hypot(shoulderPx.x - hipPx.x, shoulderPx.y - hipPx.y) : null;
             rpgRepWasValidThroughout = canCount;
             rpgInvalidStreak = 0;
@@ -2486,15 +3999,22 @@ function rpgDetectionLoop() {
             const threshold = rpgDownBodyScale
               ? CONFIG.MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO * rpgDownBodyScale
               : CONFIG.MIN_SHOULDER_MOVEMENT_RATIO * canvas.height;
-            const shoulderMoved =
-              rpgDownShoulderY !== null && Math.abs(shoulderPx.y - rpgDownShoulderY) > threshold;
+            rpgDownShoulderYExtreme = Math.max(rpgDownShoulderYExtreme, Math.abs(shoulderPx.y - rpgDownShoulderY));
+            const shoulderMoved = rpgDownShoulderY !== null && rpgDownShoulderYExtreme > threshold;
             const enoughTimePassed = now - rpgLastRepTimestamp > CONFIG.MIN_REP_INTERVAL_MS;
 
             if (rpgRepWasValidThroughout && canCount && shoulderMoved && enoughTimePassed) {
               rpgLastRepTimestamp = now;
               registerRpgRep();
+              lastRpgRepRejectedReason = null;
+            } else if (isPoseDebugEnabled()) {
+              if (!rpgRepWasValidThroughout) lastRpgRepRejectedReason = "lost tracking/visibility during the down phase";
+              else if (!shoulderMoved) lastRpgRepRejectedReason = `shoulder movement too small (${(rpgDownShoulderYExtreme / canvas.height).toFixed(3)} < ${(threshold / canvas.height).toFixed(3)})`;
+              else if (!enoughTimePassed) lastRpgRepRejectedReason = "too soon after the previous rep";
+              else lastRpgRepRejectedReason = "angle never reached UP threshold cleanly";
             }
             rpgDownShoulderY = null;
+            rpgDownShoulderYExtreme = 0;
             rpgDownBodyScale = null;
           }
         } else {
@@ -2555,6 +4075,15 @@ async function flushPendingRpgReps() {
     rpgMonsterHp = res.monster_hp;
     updateMonsterHpBar();
     showRpgHitFeedback(res.damage_dealt, res.monster_hp);
+
+    // V1.9: armor-upgrade / shield-upgrade / realm-completion can fire on
+    // ANY hit (not just the one that defeats a monster) — queue it and
+    // show it once the player is back on RPG home, never mid-camera-exercise.
+    if (res.emberfall_progress) {
+      if (res.emberfall_progress.armor_upgraded) rpgPendingArmorUpgrade = res.emberfall_progress.armor_upgraded;
+      if (res.emberfall_progress.shield_upgraded) rpgPendingShieldUpgrade = res.emberfall_progress.shield_upgraded;
+      if (res.emberfall_progress.realm_completed) rpgPendingRealmCompleted = res.emberfall_progress.realm_completed;
+    }
 
     // Authoritative stop trigger: HP <= 0 always means the fight is over,
     // regardless of whether THIS specific request happened to carry the
@@ -2623,9 +4152,10 @@ async function finishRpgBattle(reward) {
 // rep being detected or sent.
 function showRpgHitFeedback(damage, newHp) {
   const icon = document.getElementById("battleMonsterIcon");
-  icon.classList.remove("rpgMonsterShake");
+  const shakeClass = rpgIsBossBattle ? "rpgBossHitShake" : "rpgMonsterShake";
+  icon.classList.remove("rpgMonsterShake", "rpgBossHitShake");
   void icon.offsetWidth; // restart the animation even on rapid consecutive hits
-  icon.classList.add("rpgMonsterShake");
+  icon.classList.add(shakeClass);
 
   const dmgEl = document.getElementById("rpgDamagePopup");
   dmgEl.textContent = `-${damage}`;
@@ -2638,6 +4168,15 @@ function showRpgHitFeedback(damage, newHp) {
   void hpFill.offsetWidth;
   hpFill.classList.add("rpgHpFlash");
   hpFill.classList.toggle("rpgHpDanger", newHp > 0 && rpgMonsterMaxHp > 0 && newHp <= rpgMonsterMaxHp * 0.25);
+
+  // Boss hits carry more weight: a brief red flash across the whole
+  // battle screen, on top of the monster's own (larger) shake above.
+  if (rpgIsBossBattle) {
+    const screen = document.getElementById("rpgBattleScreen");
+    screen.classList.remove("rpgBossFlash");
+    void screen.offsetWidth;
+    screen.classList.add("rpgBossFlash");
+  }
 }
 
 // The final hit gets a brief (~1.5-3s total) special sequence before the
@@ -2650,12 +4189,20 @@ function playRpgDefeatSequence() {
     const finalHitBanner = document.getElementById("rpgFinalHitBanner");
     const defeatedBanner = document.getElementById("rpgDefeatedBanner");
     const prefersReducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const stepMs = prefersReducedMotion ? 150 : 900;
+    const stepMs = prefersReducedMotion ? 150 : (rpgIsBossBattle ? 1200 : 900);
+    const shakeClass = rpgIsBossBattle ? "rpgBossHitShake" : "rpgMonsterShake";
+
+    if (rpgIsBossBattle) {
+      defeatedBanner.textContent = "ASHEN GUARDIAN DEFEATED";
+      spawnEmberParticles(document.getElementById("battleMonsterHeader"), 16);
+    } else {
+      defeatedBanner.textContent = "DEFEATED!";
+    }
 
     finalHitBanner.classList.remove("hidden");
-    icon.classList.remove("rpgMonsterShake");
+    icon.classList.remove("rpgMonsterShake", "rpgBossHitShake");
     void icon.offsetWidth;
-    icon.classList.add("rpgMonsterShake");
+    icon.classList.add(shakeClass);
 
     setTimeout(() => {
       finalHitBanner.classList.add("hidden");
@@ -2663,9 +4210,9 @@ function playRpgDefeatSequence() {
       defeatedBanner.classList.remove("hidden");
       setTimeout(() => {
         defeatedBanner.classList.add("hidden");
-        icon.classList.remove("rpgMonsterDefeated", "rpgMonsterShake");
+        icon.classList.remove("rpgMonsterDefeated", "rpgMonsterShake", "rpgBossHitShake");
         resolve();
-      }, prefersReducedMotion ? 150 : 1200);
+      }, prefersReducedMotion ? 150 : (rpgIsBossBattle ? 1600 : 1200));
     }, stepMs);
   });
 }
@@ -2680,7 +4227,7 @@ function showRpgResult(outcome) {
   document.getElementById("rpgResultDefeated").textContent = `${defeatedBefore} → ${defeatedBefore + 1}`;
 
   document.getElementById("rpgResultTitle").textContent = "VICTORY!";
-  document.getElementById("rpgResultSubtitle").textContent = `${outcome.reward.monster_name} defeated`;
+  document.getElementById("rpgResultSubtitle").textContent = `${outcome.reward.monster_theme_name || outcome.reward.monster_name} defeated`;
   document.getElementById("rpgResultXp").textContent = `+${outcome.reward.xp_reward} XP`;
   document.getElementById("rpgResultGold").textContent = `+${outcome.reward.gold_reward} Gold`;
   rewardsEl.classList.remove("hidden");
@@ -2691,6 +4238,7 @@ function showRpgResult(outcome) {
     levelUpEl.textContent = `🎉 LEVEL UP! You reached RPG Level ${outcome.reward.new_rpg_level}.`;
     levelUpEl.classList.remove("hidden");
     playBeep(1318, 0.2);
+    spawnEmberParticles(levelUpEl, 8);
   } else {
     levelUpEl.classList.add("hidden");
   }
@@ -2699,7 +4247,15 @@ function showRpgResult(outcome) {
   // Refresh RPG profile (XP/level/rank/gold/defeated/XP-bar progress) from
   // the server after victory rather than relying on the stale pre-battle
   // cache — the next time Home/RPG is opened it will already be correct.
-  api("/rpg/profile").then(p => { rpgProfileCache = p; }).catch(() => {});
+  api("/rpg/profile").then(p => {
+    rpgProfileCache = p;
+    // The realm-completion moment (boss defeats only) layers ON TOP of the
+    // normal victory screen rather than replacing it — the player still
+    // sees the monster-defeat rewards, then this marketing-worthy moment.
+    if (outcome.reward.realm_completed) {
+      showRealmCompleteModal(outcome.reward.realm_completed, p.realms_completed, p.realms_total);
+    }
+  }).catch(() => {});
 }
 
 document.getElementById("rpgBattleAgainBtn").addEventListener("click", () => {
@@ -2730,14 +4286,14 @@ async function refreshHomeRpgContinueCard() {
   try {
     const current = await api("/rpg/encounters/current");
     if (current.active) {
-      document.getElementById("homeRpgContinueIcon").textContent = current.monster_icon;
-      document.getElementById("homeRpgContinueName").textContent = current.monster_name;
+      document.getElementById("homeRpgContinueIcon").innerHTML = renderMonsterArt(current.monster_theme_name || current.monster_name, current.monster_difficulty, current.monster_is_boss, 30);
+      document.getElementById("homeRpgContinueName").textContent = current.monster_theme_name || current.monster_name;
       document.getElementById("homeRpgContinueHp").textContent = `${current.monster_hp} / ${current.monster_max_hp} HP`;
       card.classList.remove("hidden");
       document.getElementById("homeRpgContinueBtn").onclick = () => {
         setActiveNav(document.getElementById("navRpgBtn"));
-        enterRpgBattle(current.encounter_id, current.monster_name, current.monster_icon,
-          current.monster_hp, current.monster_max_hp);
+        enterRpgBattle(current.encounter_id, current.monster_theme_name || current.monster_name,
+          current.monster_difficulty, current.monster_is_boss, current.monster_hp, current.monster_max_hp);
       };
     } else {
       card.classList.add("hidden");
@@ -2772,7 +4328,9 @@ function ensureCameraSetupThenProceed(actionFn) {
   startSetupCamera();
 }
 
+let setupPoseTracker = createPoseTrackerState();
 async function startSetupCamera() {
+  resetPoseTracker(setupPoseTracker);
   const video = document.getElementById("setupCameraVideo");
   const statusEl = document.getElementById("setupCameraStatus");
   try {
@@ -2783,6 +4341,7 @@ async function startSetupCamera() {
     });
     video.srcObject = setupCameraStream;
     await video.play();
+    setCameraActiveIndicator("setupCameraActiveIndicator", true);
 
     statusEl.textContent = "🧠 Loading AI model…";
     const timeoutPromise = new Promise((_, reject) =>
@@ -2800,6 +4359,7 @@ async function startSetupCamera() {
 
 function stopSetupCamera() {
   setupDetectionRunning = false;
+  setCameraActiveIndicator("setupCameraActiveIndicator", false);
   if (setupCameraStream) {
     setupCameraStream.getTracks().forEach(t => t.stop());
     setupCameraStream = null;
@@ -2825,11 +4385,13 @@ function setupDetectionLoop() {
       bodyCheck.textContent = "🟢 Body detected";
       bodyCheck.classList.add("setupCheckGood");
 
-      const leftVis = (lm[11]?.visibility || 0) + (lm[13]?.visibility || 0) + (lm[15]?.visibility || 0) + (lm[27]?.visibility || 0);
-      const rightVis = (lm[12]?.visibility || 0) + (lm[14]?.visibility || 0) + (lm[16]?.visibility || 0) + (lm[28]?.visibility || 0);
-      const useRight = rightVis >= leftVis;
-      const idx = useRight ? [12, 14, 16, 24, 26, 28] : [11, 13, 15, 23, 25, 27];
-      const parts = idx.map(i => lm[i]);
+      // SAME shared side-lock/smoothing pipeline as every other camera
+      // screen (see trackPoseLandmarks) — no separate landmark-selection
+      // logic here either. No rep in progress, so side-switching stays
+      // always allowed (pass "up").
+      const tracked = trackPoseLandmarks(setupPoseTracker, lm, "up");
+      const idxObj = POSE_SIDE_LANDMARKS[tracked.side];
+      const parts = [idxObj.shoulder, idxObj.elbow, idxObj.wrist, idxObj.hip, idxObj.knee, idxObj.ankle].map(i => lm[i]);
       const fullBodyVisible = parts.every(p => (p?.visibility || 0) > CONFIG.MIN_BODY_VISIBILITY);
       const personTooSmall = parts.every(p => p) && (Math.max(...parts.map(p => p.y)) - Math.min(...parts.map(p => p.y))) < 0.25;
 

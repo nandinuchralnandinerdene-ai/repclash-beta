@@ -32,6 +32,18 @@
   --fs-lg: 18px;
   --fs-xl: 22px;
   --fs-2xl: 28px;
+
+  /* --- RPG-only dark-fantasy palette (scoped to .rpg-themed elements —
+     the rest of VISOREP keeps its existing orange/cyan identity above) ---
+     Extracted from the approved concept reference board. */
+  --rpg-bg-deep: #0e0f12;
+  --rpg-bg-panel: #1a1c22;
+  --rpg-bg-ember-tint: #2a1f1c;
+  --rpg-ember: #ff5a1f;
+  --rpg-gold: #ffb347;
+  --rpg-crimson: #8b1e1e;
+  --rpg-cyan: #2aa6b7;
+  --rpg-bronze: #c0a060;
 }
 
 * { box-sizing: border-box; }
@@ -142,6 +154,31 @@ header h1 {
 .historyOutcome { font-weight: 600; flex: 1; }
 .historyOpponent { color: var(--muted); flex: 1; text-align: center; }
 .historyScore { font-weight: 700; flex: 1; text-align: right; }
+
+/* Friend activity feed — a timeline, not just a stack of plain rows. */
+#friendsActivityList {
+  position: relative;
+  padding-left: 14px;
+  border-left: 2px solid var(--border);
+}
+#friendsActivityList .historyItem {
+  position: relative;
+  background: transparent;
+  padding: 8px 0 8px 16px;
+  border-radius: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+#friendsActivityList .historyItem::before {
+  content: "";
+  position: absolute;
+  left: -21px;
+  top: 14px;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--accent2);
+  box-shadow: 0 0 0 3px var(--card);
+}
 .historyEmpty { color: var(--muted); text-align: center; padding: 20px; list-style: none; }
 .emptyState { text-align: center; padding: var(--sp-5) var(--sp-3); list-style: none; }
 .emptyStateTitle { font-weight: 800; font-size: var(--fs-base); margin-bottom: 4px; letter-spacing: 0.01em; }
@@ -194,6 +231,32 @@ main {
 
 .cardWide { max-width: 560px; }
 
+/* ============================================================ */
+/* RPG dark-fantasy theme — scoped to .rpg-themed screens only,   */
+/* matching the approved concept reference board's palette.       */
+/* ============================================================ */
+.rpg-themed {
+  background: linear-gradient(160deg, var(--rpg-bg-panel), var(--rpg-bg-deep) 75%);
+  border: 1px solid #33291f;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.45), inset 0 0 40px rgba(255,90,31,0.03);
+}
+.rpg-themed h2, .rpg-themed h3 {
+  letter-spacing: 0.04em;
+  background: linear-gradient(90deg, var(--rpg-gold), var(--rpg-ember));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.rpg-themed button:not(.secondary):not(.linkBtn) {
+  background: linear-gradient(180deg, var(--rpg-ember), var(--rpg-crimson));
+  border: 1px solid #ffb34755;
+  box-shadow: 0 0 16px rgba(255,90,31,0.25);
+}
+.rpg-themed .rpgStatBox {
+  background: #14161c;
+  border: 1px solid #2a241a;
+}
+
 #cameraWrap {
   position: relative;
   width: 100%;
@@ -239,7 +302,7 @@ h3 {
   color: var(--text);
 }
 
-input[type="text"], input[type="password"] {
+input[type="text"], input[type="password"], input[type="email"], input[type="file"] {
   width: 100%;
   padding: var(--sp-3);
   border-radius: var(--radius-sm);
@@ -248,12 +311,108 @@ input[type="text"], input[type="password"] {
   color: var(--text);
   font-size: var(--fs-base);
   margin-bottom: var(--sp-3);
+  box-sizing: border-box;
 }
-input[type="text"]:focus, input[type="password"]:focus {
+input[type="text"]:focus, input[type="password"]:focus, input[type="email"]:focus {
   outline: none;
   border-color: var(--accent2);
 }
 input.inputError { border-color: var(--danger); }
+
+.linkBtn {
+  background: transparent;
+  border: none;
+  color: var(--accent2);
+  font-size: 13px;
+  font-weight: 600;
+  padding: var(--sp-2);
+  width: auto;
+  text-decoration: underline;
+}
+.linkBtn:hover { opacity: 0.85; }
+
+.googleAuthBtn {
+  background: #fff;
+  color: #1f1f1f;
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: var(--sp-3);
+}
+.googleAuthIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: #4285F4;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+/* --- Camera-active indicator: shown whenever any camera stream is live,
+   never during login/signup/home/profile/notifications — see app.js
+   showCameraActiveIndicator()/hideCameraActiveIndicator(). --- */
+.cameraActiveIndicator {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(0,0,0,0.55);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 5px 10px;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+}
+.cameraActiveDot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #ff3b3b;
+  animation: cameraDotPulse 1.4s ease-in-out infinite;
+}
+@keyframes cameraDotPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.cameraPrivacyNote {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 6px 0 12px;
+  line-height: 1.4;
+}
+
+select {
+  width: 100%;
+  padding: var(--sp-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: #101216;
+  color: var(--text);
+  font-size: var(--fs-base);
+  margin-bottom: var(--sp-3);
+  box-sizing: border-box;
+}
+
+#profilePicturePreviewRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: var(--sp-2);
+}
+#profilePicturePreviewImg {
+  width: 64px; height: 64px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid var(--border);
+}
 
 button {
   background: var(--accent);
@@ -282,19 +441,24 @@ button.secondary {
 #findMatchBtn {
   font-size: var(--fs-lg);
   padding: var(--sp-4) var(--sp-5);
-  letter-spacing: 0.02em;
-  box-shadow: 0 6px 20px rgba(255, 90, 60, 0.25);
+  letter-spacing: 0.03em;
+  font-weight: 800;
+  box-shadow: 0 8px 26px rgba(255, 90, 60, 0.32), 0 2px 0 rgba(255,255,255,0.15) inset;
   background: linear-gradient(135deg, var(--accent), #ff3c78);
+  border: 1px solid rgba(255,255,255,0.12);
+  transition: transform 0.15s ease, box-shadow 0.2s ease, filter 0.2s ease;
 }
+#findMatchBtn:hover { filter: brightness(1.08); box-shadow: 0 10px 30px rgba(255, 90, 60, 0.42), 0 2px 0 rgba(255,255,255,0.15) inset; }
+#findMatchBtn:active { transform: scale(0.97); }
 
 .heroKicker {
   color: var(--accent2);
   font-size: var(--fs-xs);
   font-weight: 800;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.14em;
   margin-bottom: var(--sp-2);
 }
-.heroTitle { font-size: var(--fs-2xl); line-height: 1.15; }
+.heroTitle { font-size: var(--fs-2xl); line-height: 1.15; letter-spacing: -0.01em; }
 .heroSub { margin-bottom: var(--sp-4); }
 
 #heroStatsRow {
@@ -304,13 +468,15 @@ button.secondary {
   margin: var(--sp-5) 0 var(--sp-2);
 }
 .heroStat {
-  background: var(--surface2);
+  background: linear-gradient(160deg, var(--surface2), var(--card) 130%);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: var(--sp-3) var(--sp-2);
+  transition: border-color 0.2s ease, transform 0.15s ease;
 }
-.heroStatLabel { color: var(--muted); font-size: var(--fs-xs); font-weight: 700; letter-spacing: 0.04em; margin-bottom: 4px; }
-.heroStatValue { font-size: var(--fs-xl); font-weight: 800; color: var(--text); }
+.heroStat:hover { border-color: var(--accent2); transform: translateY(-1px); }
+.heroStatLabel { color: var(--muted); font-size: var(--fs-xs); font-weight: 700; letter-spacing: 0.06em; margin-bottom: 4px; }
+.heroStatValue { font-size: var(--fs-xl); font-weight: 800; color: var(--text); background: linear-gradient(90deg, var(--accent2), var(--text) 140%); -webkit-background-clip: text; background-clip: text; }
 #heroPlayerCountLine { text-align: center; margin: 0 0 var(--sp-3); }
 
 .error { color: #ff6b6b; min-height: 20px; }
@@ -325,7 +491,12 @@ button.secondary {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-#leaderboardBox { margin-top: var(--sp-6); text-align: left; }
+#leaderboardBox {
+  margin-top: var(--sp-6);
+  padding-top: var(--sp-5);
+  border-top: 1px solid var(--border);
+  text-align: left;
+}
 #leaderboardList {
   list-style: none;
   padding: 0;
@@ -399,9 +570,82 @@ button.secondary {
 }
 
 /* ============================================================ */
+/* Match intro ("VS" row) — ready screen, competitive feel        */
+/* ============================================================ */
+#matchIntroRow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  margin: var(--sp-3) 0 var(--sp-4);
+}
+.matchIntroSide {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+.matchIntroAvatarWrap {
+  width: 64px; height: 64px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: #101216;
+  border: 2px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.matchIntroAvatarImg {
+  width: 100%; height: 100%;
+  object-fit: cover;
+}
+.matchIntroAvatarEmoji { font-size: 30px; }
+.matchIntroName {
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.matchIntroRank {
+  font-size: 11px;
+  color: var(--accent2);
+  margin-top: 1px;
+}
+.matchIntroVs {
+  font-size: var(--fs-lg);
+  font-weight: 800;
+  color: var(--accent2);
+  flex-shrink: 0;
+}
+
+/* ============================================================ */
 /* PvP shared battle bar — one bar, real authoritative counts     */
 /* ============================================================ */
 #battleBar { margin-bottom: var(--sp-3); }
+#battleBarAvatarsRow {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.battleBarAvatarSide { display: flex; }
+.battleBarAvatarWrap {
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: #101216;
+  border: 2px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.battleBarAvatarImg { width: 100%; height: 100%; object-fit: cover; }
+.battleBarAvatarEmoji { font-size: 22px; }
 #battleBarLabelsRow {
   display: flex;
   justify-content: space-between;
@@ -472,13 +716,22 @@ button.secondary {
   background: rgba(15, 17, 21, 0.92);
   border-radius: 16px;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 10px;
+  text-align: center;
+  padding: 16px;
 }
 #countdownNumber {
   font-size: 96px;
   font-weight: 900;
   color: var(--accent);
+}
+#countdownHint {
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: var(--muted);
 }
 
 .badge {
@@ -583,7 +836,9 @@ button.secondary {
   box-shadow: 0 0 0 4px rgba(60,232,255,0.12);
   border-radius: 50%;
   flex-shrink: 0;
+  overflow: hidden;
 }
+#profileAvatarImg { width: 100%; height: 100%; object-fit: cover; }
 #profileNameBlock { flex: 1; }
 #profileUsername { font-size: var(--fs-xl); font-weight: 800; letter-spacing: -0.01em; }
 #profileCountry { color: var(--muted); font-size: var(--fs-sm); margin: 2px 0; }
@@ -725,6 +980,33 @@ button.secondary {
   background: #2a2416;
   color: #ffb84d;
   border: 1px solid #ffb84d;
+  position: relative;
+  overflow: visible;
+}
+#resultLevelUpBanner:not(.hidden), #rpgLevelUpBanner:not(.hidden) {
+  position: relative;
+  animation: levelUpBannerPop 0.9s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+#resultLevelUpBanner:not(.hidden)::before, #rpgLevelUpBanner:not(.hidden)::before {
+  content: "";
+  position: absolute;
+  inset: -14px;
+  border-radius: inherit;
+  background: radial-gradient(ellipse, rgba(255,179,71,0.4) 0%, transparent 70%);
+  animation: upgradeGlowPulse 1s ease-out;
+  pointer-events: none;
+  z-index: -1;
+}
+@keyframes levelUpBannerPop {
+  0% { opacity: 0; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.06); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #resultLevelUpBanner:not(.hidden), #rpgLevelUpBanner:not(.hidden),
+  #resultLevelUpBanner:not(.hidden)::before, #rpgLevelUpBanner:not(.hidden)::before {
+    animation-duration: 0.01ms !important;
+  }
 }
 
 /* ============================================================ */
@@ -849,33 +1131,231 @@ button.secondary {
 #challengeModalText { font-size: var(--fs-lg); font-weight: 800; margin-bottom: 6px; }
 
 /* ============================================================ */
+/* AI camera onboarding modal                                    */
+/* ============================================================ */
+#aiIntroModal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 250;
+  padding: 16px;
+}
+#aiIntroModalBox {
+  background: linear-gradient(160deg, #16202a, var(--card) 55%);
+  border: 1px solid rgba(60,232,255,0.35);
+  box-shadow: 0 0 40px rgba(60,232,255,0.12), 0 20px 50px rgba(0,0,0,0.5);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-6) var(--sp-5);
+  max-width: 380px;
+  width: 100%;
+  text-align: center;
+  max-height: 90vh;
+  overflow-y: auto;
+  animation: challengePop 0.25s ease;
+}
+@media (min-width: 640px) {
+  /* Desktop: the infographic gets real room to be readable without the
+     page (or this modal) becoming unnecessarily huge. */
+  #aiIntroModalBox { max-width: 480px; }
+}
+#aiIntroTitle { font-size: var(--fs-lg); margin-bottom: var(--sp-3); }
+
+/* RPG-specific "How It Works" — same structural language as the PvP
+   modal above, RPG (ember/gold) theming via the shared .rpg-themed class. */
+#rpgIntroModal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 250;
+  padding: 16px;
+}
+#rpgIntroModalBox {
+  border: 1px solid var(--rpg-gold);
+  box-shadow: 0 0 50px rgba(255,179,71,0.18), 0 20px 50px rgba(0,0,0,0.5);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-6) var(--sp-5);
+  max-width: 380px;
+  width: 100%;
+  text-align: center;
+  max-height: 90vh;
+  overflow-y: auto;
+  animation: challengePop 0.25s ease;
+}
+@media (min-width: 640px) {
+  #rpgIntroModalBox { max-width: 480px; }
+}
+#rpgIntroTitle { font-size: var(--fs-lg); margin-bottom: var(--sp-3); }
+#rpgIntroInfographicWrap {
+  margin: var(--sp-4) 0;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  position: relative;
+}
+#rpgIntroInfographicWrap img { width: 100%; height: auto; display: block; }
+#rpgIntroInfographicWrap a {
+  display: block;
+  text-align: center;
+  padding: 8px;
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: var(--rpg-gold);
+  background: rgba(0,0,0,0.35);
+  text-decoration: none;
+}
+#rpgIntroInfographicWrap a:hover { background: rgba(0,0,0,0.5); }
+#rpgIntroLoopTitle {
+  font-size: var(--fs-base);
+  margin: var(--sp-4) 0 var(--sp-3);
+  letter-spacing: 0.04em;
+}
+#rpgIntroLoop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: var(--sp-4);
+}
+.rpgIntroLoopStep {
+  background: #14161c;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 16px;
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  width: 100%;
+}
+.rpgIntroLoopArrow { color: var(--muted); font-size: 12px; }
+.rpgIntroLoopFinal {
+  border-color: var(--rpg-gold);
+  color: var(--rpg-gold);
+  box-shadow: 0 0 14px rgba(255,179,71,0.25);
+}
+#rpgIntroContinueBtn {
+  background: linear-gradient(180deg, var(--rpg-ember), var(--rpg-crimson));
+  border: 1px solid #ffb34755;
+}
+
+#howItWorksInfographicWrap {
+  margin: var(--sp-4) 0;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  position: relative;
+}
+#howItWorksInfographic {
+  display: block;
+  width: 100%;
+  height: auto; /* preserves the source image's own aspect ratio — never stretched/cropped */
+}
+#howItWorksFullSizeLink {
+  display: block;
+  text-align: center;
+  padding: 8px;
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: var(--accent2);
+  background: rgba(0,0,0,0.35);
+  text-decoration: none;
+}
+#howItWorksFullSizeLink:hover { background: rgba(0,0,0,0.5); }
+
+#howItWorksSteps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  text-align: left;
+  margin: var(--sp-4) 0;
+}
+.howItWorksStep {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.howItWorksStepNum {
+  flex-shrink: 0;
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  background: var(--accent2);
+  color: #0f1115;
+  font-weight: 800;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.howItWorksStepTitle { font-weight: 800; letter-spacing: 0.02em; margin-bottom: 1px; }
+#howItWorksCameraTips { margin-bottom: var(--sp-2); }
+#howItWorksNote { color: #ffb84d; font-weight: 600; margin-bottom: var(--sp-3); }
+
+/* ============================================================ */
 /* V1.4: Friends screen                                          */
 /* ============================================================ */
-#playerSearchBox { margin-bottom: 18px; text-align: left; }
+#playerSearchBox { margin-bottom: 18px; text-align: left; position: relative; }
+#playerSearchInput {
+  padding-left: 38px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%237a8194' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='M21 21l-4.3-4.3'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 12px center;
+  background-size: 16px;
+}
+#playerSearchInput:focus {
+  border-color: var(--accent2);
+  box-shadow: 0 0 0 3px rgba(60,232,255,0.15);
+}
 #playerSearchResults { list-style: none; padding: 0; margin: 8px 0 0; max-height: 180px; overflow-y: auto; }
 
 .friendListItem {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px;
-  border-radius: 10px;
-  background: #14161c;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: linear-gradient(160deg, var(--surface2), var(--card) 140%);
+  border: 1px solid var(--border);
   margin-bottom: 8px;
   list-style: none;
   cursor: pointer;
   text-align: left;
+  transition: border-color 0.18s ease, transform 0.15s ease, box-shadow 0.18s ease;
 }
-.friendListName { flex: 1; font-weight: 600; }
-.avatarSmall { font-size: 20px; }
+.friendListItem:hover {
+  border-color: var(--accent2);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(60,232,255,0.1);
+}
+.friendListName { flex: 1; font-weight: 700; }
+.avatarSmall {
+  font-size: 18px;
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  flex-shrink: 0;
+}
 .onlineDot {
-  width: 8px; height: 8px;
+  width: 9px; height: 9px;
   border-radius: 50%;
   background: #444;
   flex-shrink: 0;
+  box-shadow: 0 0 0 2px rgba(0,0,0,0.3);
 }
-.onlineDot.isOnline { background: #3ce87c; }
-.challengeBtn { width: auto; padding: 8px 14px; font-size: 13px; }
+.onlineDot.isOnline { background: #3ce87c; box-shadow: 0 0 8px rgba(60,232,124,0.6), 0 0 0 2px rgba(0,0,0,0.3); }
+.challengeBtn {
+  width: auto;
+  padding: 9px 16px;
+  font-size: 13px;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--accent), #ff3c78);
+  box-shadow: 0 3px 12px rgba(255,90,60,0.25);
+}
 
 #friendRequestsBox { text-align: left; margin: 16px 0; }
 .requestCard {
@@ -922,6 +1402,42 @@ button.secondary {
   font-weight: 700;
 }
 #publicProfileBio { text-align: left; margin: 10px 0; }
+#publicProfileJoinDate { margin-top: 2px; }
+#publicProfileRestrictedNote {
+  text-align: center;
+  padding: var(--sp-4);
+  background: #14161c;
+  border-radius: var(--radius-md);
+  margin: var(--sp-4) 0;
+}
+
+/* Public profile RPG/character section — dark-fantasy accent, matching
+   the Profile screen's own RPG section, sitting between the competitive
+   header above and the PvP stats below (per the requested visual hierarchy). */
+#publicProfileRpgSection {
+  border-radius: var(--radius-lg);
+  padding: var(--sp-4);
+  margin: var(--sp-4) 0;
+}
+#publicProfileCharacterBlock {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: var(--sp-2) 0 var(--sp-3);
+}
+#publicProfileCharacterPortrait { margin-bottom: 8px; }
+#publicProfileLevelLine { display: flex; align-items: center; gap: 8px; }
+#publicProfileRpgLevelText { font-weight: 800; letter-spacing: 0.03em; color: var(--rpg-gold); font-size: var(--fs-sm); }
+#publicProfileEquipmentRow {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+#publicProfileRealmsLine { text-align: center; }
+
 #publicProfileStats {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -942,10 +1458,12 @@ button.secondary {
 /* ============================================================ */
 #rpgPlayerHeader {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: auto auto repeat(3, 1fr);
+  align-items: center;
   gap: 10px;
   margin: 16px 0 10px;
 }
+#rpgHomeCharacterPortrait { display: flex; align-items: center; }
 .rpgStatBox {
   background: #14161c;
   border-radius: 10px;
@@ -966,6 +1484,302 @@ button.secondary {
   width: 0%;
 }
 
+#rpgHomeRealmFlavor { font-style: italic; margin: 2px 0 var(--sp-3); }
+#rpgRealmProgressRow {
+  display: flex;
+  justify-content: flex-end;
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: #ffb84d;
+  margin-bottom: 4px;
+}
+#rpgRealmProgressTrack {
+  height: 10px;
+  background: #14161c;
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: var(--sp-3);
+}
+#rpgRealmProgressFill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), #ffb84d);
+  border-radius: 6px;
+  transition: width 0.4s ease;
+  width: 0%;
+}
+
+/* Local journey map — a connected path of locations standing in for the
+   old flat monster grid. Vertical stack on mobile, wraps naturally on
+   wider screens; the connector between nodes is a simple line, no heavy
+   animation (kept intentionally light for mobile performance). */
+#rpgLocalMap {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  margin-top: 14px;
+}
+.rpgMapNode {
+  background-color: #14161c; /* fallback for locations with no photo backdrop */
+  background-size: cover;
+  background-position: center;
+  border-radius: 12px;
+  padding: 0;
+  text-align: center;
+  border: 1px solid var(--border);
+  overflow: hidden;
+  position: relative;
+  min-height: 200px;
+  transition: transform 0.2s ease, border-color 0.2s ease;
+}
+.rpgMapNode:not(.rpgMapNode-upcoming):active { transform: scale(0.98); }
+.rpgMapNodeOverlay {
+  background: linear-gradient(180deg, rgba(14,15,18,0.35) 0%, rgba(14,15,18,0.55) 40%, rgba(14,15,18,0.92) 100%);
+  padding: 18px 14px 16px;
+  min-height: 200px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+/* ROOT CAUSE FIX (Ashen Gate showing zoomed into the top-left corner):
+   these status rules used the `background` SHORTHAND with a gradient —
+   a shorthand resets every background sub-property it doesn't mention,
+   including background-size and background-position, back to their
+   CSS-initial values (`auto` / `0% 0%` = top-left). Since these classes
+   come after the base `.rpgMapNode` rule with equal specificity, they
+   won each time, silently discarding `background-size: cover` and
+   `background-position: center` — while the actual location photo (set
+   inline via JS) kept showing because inline background-image always
+   wins on ITS OWN property, just with no cover/center rules left to
+   apply. The fix: only touch border/glow here, never the shorthand —
+   background-size/position stay exactly as the base rule defines them. */
+.rpgMapNode-completed { border-color: var(--rpg-cyan); opacity: 0.9; }
+.rpgMapNode-current {
+  border-color: var(--rpg-gold);
+  box-shadow: 0 0 20px rgba(255,179,71,0.18);
+  animation: rpgMapNodeCurrentPulse 2.6s ease-in-out infinite;
+}
+@keyframes rpgMapNodeCurrentPulse {
+  0%, 100% { box-shadow: 0 0 16px rgba(255,179,71,0.15); }
+  50% { box-shadow: 0 0 28px rgba(255,179,71,0.32); }
+}
+.rpgMapNode-upcoming { opacity: 0.55; filter: grayscale(0.5); }
+.rpgMapNodeStatus {
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--rpg-cyan);
+  margin-bottom: 2px;
+}
+.rpgMapNode-current .rpgMapNodeStatus { color: var(--rpg-gold); }
+.rpgMapNode-upcoming .rpgMapNodeStatus { color: var(--muted); }
+.rpgMapNodeIcon { display: flex; align-items: center; justify-content: center; margin-bottom: 4px; }
+.rpgMapNodeName { font-weight: 700; margin-bottom: 4px; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
+.rpgMapNodeBoss {
+  border-color: var(--rpg-crimson) !important;
+}
+.rpgMapConnector {
+  width: 3px;
+  height: 22px;
+  background: linear-gradient(var(--rpg-bronze), var(--rpg-gold), transparent);
+  margin: 0 auto;
+  opacity: 0.7;
+  border-radius: 2px;
+  box-shadow: 0 0 6px rgba(255,179,71,0.25);
+}
+
+/* World map / journey map hero banners — the real uploaded artwork */
+#rpgWorldMapBanner, #rpgJourneyMapBanner {
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  margin: var(--sp-3) 0;
+  border: 1px solid #33291f;
+}
+#rpgJourneyMapBanner img {
+  width: 100%;
+  height: auto;
+  display: block;
+  object-fit: cover;
+  max-height: 260px;
+}
+/* Fixed to the source artwork's own aspect ratio (1600x900) so the
+   hotspot layer's percentage positions always land on the same visual
+   spot regardless of container width — no cropping mismatch. */
+#rpgWorldMapBanner {
+  position: relative;
+  aspect-ratio: 16 / 9;
+}
+#rpgWorldMapBanner img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+#rpgCharacterPortrait { flex-shrink: 0; }
+#rpgCharacterPortrait img { border-radius: 8px; display: block; }
+
+#rpgCurrentArmorBox {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #14161c;
+  border: 1px solid var(--rpg-bronze);
+  border-radius: var(--radius-md);
+  padding: var(--sp-3);
+  margin: var(--sp-3) 0;
+  text-align: left;
+}
+#rpgCurrentArmorName { font-weight: 800; color: var(--rpg-gold); }
+#rpgCurrentShieldName { font-weight: 800; color: var(--rpg-cyan); }
+
+#shieldLadderWrap {
+  margin: 10px 0 var(--sp-3);
+  background: #14161c;
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+}
+.shieldTierRow {
+  display: flex;
+  justify-content: space-between;
+  padding: 5px 0;
+  font-size: var(--fs-sm);
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+.shieldTierRow:last-child { border-bottom: none; }
+.shieldTierCurrent { color: var(--rpg-gold); font-weight: 800; }
+.shieldTierPast { color: var(--rpg-cyan); }
+.shieldTierLocked { color: var(--muted); opacity: 0.6; }
+
+/* Armor upgrade modal */
+#armorUpgradeModal {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.75);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 260; padding: 16px;
+}
+#armorUpgradeModalBox {
+  background: linear-gradient(160deg, var(--rpg-bg-ember-tint), var(--card) 60%);
+  border: 1px solid var(--rpg-gold);
+  box-shadow: 0 0 50px rgba(255,179,71,0.18), 0 20px 50px rgba(0,0,0,0.5);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-6) var(--sp-5);
+  max-width: 340px;
+  text-align: center;
+  animation: upgradeModalPop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+  position: relative;
+  overflow: visible;
+}
+#armorUpgradeKicker {
+  color: var(--rpg-gold);
+  font-weight: 800;
+  font-size: var(--fs-sm);
+  letter-spacing: 0.1em;
+  margin-bottom: 10px;
+}
+#armorUpgradeArt {
+  display: flex; justify-content: center; align-items: center;
+  margin-bottom: 10px;
+  position: relative;
+  min-height: 40px;
+}
+#armorUpgradeCharacterWrap {
+  display: flex; justify-content: center; align-items: center;
+  margin-bottom: 10px;
+  position: relative;
+  min-height: 100px;
+}
+.equipmentRevealChar {
+  animation: equipmentCharReveal 0.9s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes equipmentCharReveal {
+  0% { opacity: 0; transform: scale(0.85) translateY(6px); filter: brightness(1); }
+  55% { opacity: 1; filter: brightness(1.3); }
+  100% { opacity: 1; transform: scale(1) translateY(0); filter: brightness(1); }
+}
+#armorUpgradeShieldName { font-weight: 700; color: var(--rpg-cyan); margin-bottom: 4px; }
+#armorUpgradeReps { margin-bottom: var(--sp-4); }
+@media (prefers-reduced-motion: reduce) {
+  .equipmentRevealChar { animation-duration: 0.01ms !important; }
+}
+
+/* ============================================================ */
+/* Premium equipment-upgrade celebration (armor / shield / the    */
+/* Legendary moment at 10,000 reps) — glow pulse + scale-settle +  */
+/* a small ember-particle burst, ~0.9-1.3s total, then settles.    */
+/* ============================================================ */
+@keyframes upgradeModalPop {
+  0% { opacity: 0; transform: scale(0.75); }
+  60% { opacity: 1; transform: scale(1.03); }
+  100% { opacity: 1; transform: scale(1); }
+}
+/* Radial glow ring behind the equipment art — a soft pulse, not a
+   distracting strobe. */
+#armorUpgradeArt::before {
+  content: "";
+  position: absolute;
+  inset: -20px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255,179,71,0.35) 0%, transparent 70%);
+  animation: upgradeGlowPulse 1.2s ease-out;
+  pointer-events: none;
+}
+@keyframes upgradeGlowPulse {
+  0% { opacity: 0; transform: scale(0.4); }
+  40% { opacity: 1; transform: scale(1.15); }
+  100% { opacity: 0; transform: scale(1.4); }
+}
+/* The equipment image itself: gentle 95% -> 105% -> settle, per spec. */
+#armorUpgradeArt img, #armorUpgradeArt svg {
+  animation: upgradeArtSettle 0.9s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes upgradeArtSettle {
+  0% { transform: scale(0.95); filter: brightness(1); }
+  55% { transform: scale(1.08); filter: brightness(1.35); }
+  100% { transform: scale(1); filter: brightness(1); }
+}
+/* Ember spark particles — small dots spawned by JS (spawnEmberParticles),
+   each animating outward and fading. Pure CSS keyframe, particle COUNT
+   and starting angle come from inline JS-set custom properties. */
+.emberParticle {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  background: var(--rpg-gold);
+  box-shadow: 0 0 6px 1px rgba(255,179,71,0.8);
+  pointer-events: none;
+  animation: emberParticleFly 0.9s ease-out forwards;
+  animation-delay: var(--particle-delay, 0s);
+}
+@keyframes emberParticleFly {
+  0% { opacity: 1; transform: translate(-50%, -50%) rotate(var(--particle-angle, 0deg)) translateX(0) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, -50%) rotate(var(--particle-angle, 0deg)) translateX(var(--particle-dist, 60px)) scale(0.3); }
+}
+
+/* The Legendary moment (10,000 reps) gets a visibly stronger — but still
+   tasteful — version of the same celebration: bigger glow, more sparks,
+   a distinct border color. Applied via JS adding .legendaryMoment to the
+   modal box only when shield_name === "Legendary Shield". */
+#armorUpgradeModalBox.legendaryMoment {
+  border-color: var(--rpg-crimson);
+  box-shadow: 0 0 80px rgba(255,90,31,0.35), 0 20px 60px rgba(0,0,0,0.6);
+}
+#armorUpgradeModalBox.legendaryMoment #armorUpgradeArt::before {
+  background: radial-gradient(circle, rgba(255,90,31,0.5) 0%, transparent 70%);
+  animation-duration: 1.4s;
+}
+#armorUpgradeModalBox.legendaryMoment #armorUpgradeKicker {
+  color: var(--rpg-ember);
+  font-size: var(--fs-base);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #armorUpgradeModalBox, #armorUpgradeArt::before, #armorUpgradeArt img,
+  #armorUpgradeArt svg, .emberParticle {
+    animation-duration: 0.01ms !important;
+  }
+}
+
 #monsterGrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
@@ -978,16 +1792,290 @@ button.secondary {
   padding: 14px 10px;
   text-align: center;
 }
-.monsterCardIcon { font-size: 32px; margin-bottom: 6px; }
+.monsterCardIcon { display: flex; align-items: center; justify-content: center; margin-bottom: 6px; }
 .monsterCardName { font-weight: 700; margin-bottom: 4px; }
 .monsterBattleBtn { margin-top: 10px; font-size: 13px; padding: 10px; }
 
-#homeRpgContinueCard { text-align: left; margin: 14px 0; }
-.homeRpgContinueLabel { margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; font-size: 11px; }
+.monsterCardBoss {
+  background: linear-gradient(160deg, var(--rpg-bg-ember-tint), #14161c 70%);
+  border: 1px solid var(--rpg-crimson);
+  box-shadow: 0 0 20px rgba(139,30,30,0.25);
+}
+.monsterBossTag {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--rpg-gold);
+  margin-bottom: 6px;
+}
+
+/* ============================================================ */
+/* RPG World Map — Five Realms                                   */
+/* ============================================================ */
+#rpgCharacterStrip {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: #14161c;
+  border-radius: var(--radius-md);
+  padding: var(--sp-3);
+  margin: var(--sp-3) 0 var(--sp-4);
+}
+#rpgCharacterSilhouette {
+  width: 56px; height: 56px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(60,232,255,0.15), transparent 70%);
+  border: 2px solid var(--accent2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28px;
+  flex-shrink: 0;
+}
+#rpgCharacterSummary { flex: 1; }
+#rpgCharacterFragments { font-weight: 800; font-size: var(--fs-base); }
+.rpgBadgeSlot { display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.rpgInlineEmblem { display: inline-flex; vertical-align: middle; margin-right: 6px; }
+#rpgHomeRealmTitleRow { display: flex; align-items: center; gap: 4px; }
+.rpgLockedEmblemSlot { display: flex; align-items: center; justify-content: center; margin-bottom: 6px; filter: grayscale(1); opacity: 0.8; }
+.rpgMapNodeLockedNote { font-size: var(--fs-sm); color: var(--muted); margin-top: 8px; }
+.rpgMapNodeReq { font-size: 11px; font-weight: 700; color: var(--rpg-gold); margin-top: 8px; }
+.rpgMapNodeProgressTrack {
+  height: 6px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 4px 0;
+}
+.rpgMapNodeProgressFill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--rpg-ember), var(--rpg-gold));
+  border-radius: 4px;
+}
+
+.equipmentChip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: #101216;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.equipmentChipAcquired { border-color: rgba(60,232,255,0.5); color: var(--accent2); }
+.equipmentChipLocked { opacity: 0.55; }
+
+#rpgMapLegend { text-align: center; margin-top: var(--sp-3); }
+
+/* World map hotspots — the map IS the navigation now, no card grid below
+   it. Markers are absolutely positioned (as a % of the banner) directly
+   over their approximate region in the uploaded artwork. Each marker also
+   carries a territory glow (positioned via CSS custom properties set in
+   JS) that lights up the surrounding region on hover/current, rather than
+   the marker itself being the only visual interaction. */
+#rpgWorldMapBanner { position: relative; }
+#rpgWorldMapHotspots { position: absolute; inset: 0; }
+
+.realmHotspotTerritory {
+  position: absolute;
+  left: var(--territory-left, 50%);
+  top: var(--territory-top, 50%);
+  width: var(--territory-width, 30%);
+  height: var(--territory-height, 30%);
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, currentColor 0%, transparent 70%);
+  opacity: 0;
+  filter: blur(6px);
+  transition: opacity 0.3s ease;
+  z-index: -1;
+}
+
+.realmHotspot {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  background: rgba(14,15,18,0.55);
+  border: 1px solid var(--rpg-bronze);
+  border-radius: 999px;
+  padding: 6px 10px 5px;
+  cursor: pointer;
+  backdrop-filter: blur(1px);
+  transition: transform 0.15s ease, opacity 0.25s ease, filter 0.25s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  max-width: 96px;
+}
+.realmHotspot:active { transform: translate(-50%, -50%) scale(0.94); }
+.realmHotspotEmblem { display: flex; transition: transform 0.2s ease; }
+.realmHotspotState { font-size: 11px; line-height: 1; }
+.realmHotspotLabel {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 90px;
+  transition: font-size 0.2s ease, color 0.2s ease;
+}
+
+/* Dimming the OTHER realms while one is hovered — makes the hovered
+   territory read as "selected" against the rest of the map. */
+.realmHotspot.realmHotspotDimmed { opacity: 0.45; filter: grayscale(0.35); }
+
+.realmHotspotAvailable {
+  border-color: var(--rpg-gold);
+  box-shadow: 0 0 18px rgba(255,179,71,0.35);
+  color: var(--rpg-gold); /* feeds currentColor into the territory glow */
+}
+.realmHotspotAvailable .realmHotspotLabel { color: var(--rpg-gold); }
+/* Current realm: persistent (but subtle) glow + slow pulse — always
+   visible at low intensity, not just on hover, without looking like a
+   giant button. */
+.realmHotspotAvailable .realmHotspotTerritory { opacity: 0.22; animation: realmTerritoryPulse 3.2s ease-in-out infinite; }
+@keyframes realmTerritoryPulse {
+  0%, 100% { opacity: 0.16; }
+  50% { opacity: 0.30; }
+}
+.realmHotspotAvailable:hover .realmHotspotTerritory,
+.realmHotspotAvailable:focus-visible .realmHotspotTerritory { opacity: 0.55; animation: none; }
+
+.realmHotspotCompleted {
+  border-color: var(--rpg-cyan);
+  box-shadow: 0 0 14px rgba(42,166,183,0.3);
+  color: var(--rpg-cyan);
+}
+.realmHotspotCompleted .realmHotspotLabel { color: var(--rpg-cyan); }
+.realmHotspotCompleted .realmHotspotTerritory { opacity: 0.12; }
+.realmHotspotCompleted:hover .realmHotspotTerritory { opacity: 0.4; }
+
+.realmHotspotLocked { opacity: 0.68; color: var(--muted); }
+.realmHotspotLocked .realmHotspotEmblem { filter: grayscale(1); }
+.realmHotspotLocked .realmHotspotLabel { color: var(--muted); }
+/* Locked regions stay visually muted even on hover — a faint territory
+   glow acknowledges the interaction (still clickable -> shows the Coming
+   Soon modal) without implying the realm is actually playable. */
+.realmHotspotLocked:hover .realmHotspotTerritory { opacity: 0.15; }
+
+/* Any hovered realm: label brightens/grows slightly, emblem lifts a touch. */
+.realmHotspot:hover .realmHotspotLabel { font-size: 11px; }
+.realmHotspot:hover .realmHotspotEmblem { transform: translateY(-2px) scale(1.08); }
+.realmHotspot:hover { cursor: pointer; }
+
+/* Locked-realm modal */
+#realmLockedModal {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.7);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 250; padding: 16px;
+}
+#realmLockedModalBox {
+  background: linear-gradient(160deg, #1a1a22, var(--card) 60%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-6) var(--sp-5);
+  max-width: 320px;
+  text-align: center;
+  animation: challengePop 0.25s ease;
+}
+#realmLockedIcon { font-size: 40px; margin-bottom: 10px; opacity: 0.7; }
+
+/* Realm-completion modal — the marketing moment */
+#realmCompleteModal {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.75);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 260; padding: 16px;
+}
+#realmCompleteModalBox {
+  background: linear-gradient(160deg, #241610, var(--card) 60%);
+  border: 1px solid rgba(255,184,77,0.5);
+  box-shadow: 0 0 50px rgba(255,184,77,0.18), 0 20px 50px rgba(0,0,0,0.5);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-6) var(--sp-5);
+  max-width: 340px;
+  text-align: center;
+  animation: challengePop 0.3s ease;
+}
+#realmCompleteKicker {
+  color: #ffb84d;
+  font-weight: 800;
+  font-size: var(--fs-sm);
+  letter-spacing: 0.12em;
+  margin-bottom: 6px;
+}
+#realmCompleteCheck { font-size: 40px; color: var(--accent2); margin: 6px 0; }
+#realmCompleteReward {
+  margin: var(--sp-4) 0;
+  padding: var(--sp-3);
+  background: #14161c;
+  border-radius: var(--radius-md);
+}
+#realmCompleteRewardIcon { font-size: 32px; margin-bottom: 4px; position: relative; display: flex; justify-content: center; }
+#realmCompleteRewardName { font-weight: 800; letter-spacing: 0.04em; color: #ffb84d; }
+#realmCompleteCounter { font-weight: 700; margin-bottom: var(--sp-4); }
+
+/* Profile RPG section */
+#profileRpgSection {
+  border-radius: var(--radius-lg);
+  padding: var(--sp-4);
+  margin: var(--sp-3) 0;
+}
+#profileRpgCharacterBlock {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: var(--sp-4) 0 var(--sp-3);
+}
+#profileRpgCharacterPortrait { margin-bottom: 10px; }
+#profileRpgLevelLine {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#profileRpgLevelRankText {
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--rpg-gold);
+}
+#profileRpgSummary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0;
+}
+#profileRpgSummary .rpgStatBox { flex: 1; }
+#profileRpgEquipment {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Home's RPG-continue card: a deliberate, thin dark-fantasy accent so it
+   reads as "a bridge to the RPG system" without turning the whole
+   competitive Home page orange. */
+#homeRpgContinueCard {
+  text-align: left;
+  margin: 14px 0;
+  background: linear-gradient(160deg, var(--rpg-bg-ember-tint), var(--surface2) 140%);
+  border: 1px solid var(--rpg-bronze);
+}
+.homeRpgContinueLabel { margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px; font-weight: 800; color: var(--rpg-gold); }
 .homeRpgContinueRow { display: flex; align-items: center; gap: 12px; }
 .homeRpgContinueRow .monsterCardIcon { margin-bottom: 0; font-size: 28px; }
 .homeRpgContinueRow > div:nth-child(2) { flex: 1; text-align: left; }
-.homeRpgContinueRow button { width: auto; padding: 10px 16px; margin: 0; }
+.homeRpgContinueRow button {
+  width: auto; padding: 10px 16px; margin: 0;
+  background: linear-gradient(180deg, var(--rpg-ember), var(--rpg-crimson));
+  border: 1px solid #ffb34755;
+  box-shadow: 0 0 14px rgba(255,90,31,0.25);
+}
 
 /* Battle screen */
 #battleMonsterHeader {
@@ -1000,6 +2088,16 @@ button.secondary {
   gap: 4px;
 }
 #battleMonsterIcon { font-size: 28px; margin-right: 8px; display: inline-block; }
+#battleMonsterIcon img, #battleMonsterIcon svg {
+  animation: rpgMonsterIdle 3.4s ease-in-out infinite;
+}
+@keyframes rpgMonsterIdle {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #battleMonsterIcon img, #battleMonsterIcon svg { animation: none; }
+}
 #monsterHpBarTrack {
   height: 16px;
   background: #14161c;
@@ -1016,6 +2114,103 @@ button.secondary {
 }
 #monsterHpBarFill.rpgHpDanger { background: linear-gradient(90deg, #b91c1c, #ff5a3c); }
 #monsterHpBarFill.rpgHpFlash { filter: brightness(1.8); }
+
+/* ============================================================ */
+/* Boss presentation — Ashen Guardian only. Normal Slime (and every  */
+/* other regular monster) never gets .bossEncounter, so this never   */
+/* changes anything about a normal fight.                            */
+/* ============================================================ */
+#rpgBattleArenaOverlay {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  opacity: 0;
+  transition: opacity 0.6s ease;
+  pointer-events: none;
+  z-index: 0;
+  border-radius: inherit;
+}
+#rpgBattleScreen { position: relative; overflow: hidden; }
+/* Normal fights: same backdrop mechanism as boss, much subtler — reads
+   as "you're at this location," not a dramatic reveal. */
+#rpgBattleArenaOverlay.hasBackdrop { opacity: 0.22; }
+#rpgBattleArenaOverlay.hasBackdrop::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(14,15,18,0.5), rgba(14,15,18,0.88) 85%);
+}
+#rpgBattleScreen.bossEncounter #rpgBattleArenaOverlay.hasBackdrop { opacity: 0.55; }
+#rpgBattleScreen.bossEncounter #rpgBattleArenaOverlay.hasBackdrop::after {
+  background: linear-gradient(180deg, rgba(14,15,18,0.35), rgba(14,15,18,0.85) 80%);
+}
+/* Everything else on the battle screen sits above the arena backdrop. */
+#rpgBattleScreen > *:not(#rpgBattleArenaOverlay):not(#rpgBattleIntroFlash) { position: relative; z-index: 1; }
+
+#battleBossLabel {
+  display: block;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: var(--rpg-crimson);
+  text-shadow: 0 0 10px rgba(255,90,31,0.6);
+  margin-bottom: 2px;
+}
+#rpgBattleScreen.bossEncounter #battleMonsterHeader { font-size: 24px; }
+#rpgBattleScreen.bossEncounter #battleMonsterIcon { font-size: 36px; }
+
+/* Boss HP bar: taller, stronger frame/glow than the normal Slime bar. */
+#rpgBattleScreen.bossEncounter #monsterHpBarTrack {
+  height: 26px;
+  border: 1px solid var(--rpg-crimson);
+  box-shadow: 0 0 20px rgba(255,90,31,0.3);
+}
+#rpgBattleScreen.bossEncounter #monsterHpBarFill {
+  background: linear-gradient(90deg, #8b1e1e, var(--rpg-ember), #ffb347);
+}
+
+/* Boss intro: brief dark flash + ember reveal, ~1.2s total. */
+#rpgBattleIntroFlash {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  background: #000;
+  pointer-events: none;
+  border-radius: inherit;
+}
+#rpgBattleIntroFlash.rpgBossIntroPlay { animation: rpgBossIntroAnim 1.2s ease forwards; }
+@keyframes rpgBossIntroAnim {
+  0% { opacity: 1; }
+  25% { opacity: 0.85; background: radial-gradient(circle, rgba(255,90,31,0.5), #000 70%); }
+  100% { opacity: 0; }
+}
+
+/* Heavier boss hit shake (larger amplitude than the normal monster shake). */
+@keyframes rpgBossHitShakeAnim {
+  0%, 100% { transform: translateX(0); }
+  15% { transform: translateX(-10px) rotate(-3deg); }
+  30% { transform: translateX(9px) rotate(3deg); }
+  45% { transform: translateX(-7px) rotate(-2deg); }
+  60% { transform: translateX(6px) rotate(2deg); }
+  75% { transform: translateX(-3px); }
+}
+.rpgBossHitShake { animation: rpgBossHitShakeAnim 0.4s ease; }
+
+/* A brief red flash across the whole battle screen on a boss hit — makes
+   boss attacks feel heavier than the normal monster's simple shake. */
+@keyframes rpgBossFlashAnim {
+  0% { box-shadow: inset 0 0 0 0 rgba(255,60,30,0); }
+  20% { box-shadow: inset 0 0 60px 10px rgba(255,60,30,0.35); }
+  100% { box-shadow: inset 0 0 0 0 rgba(255,60,30,0); }
+}
+.rpgBossFlash { animation: rpgBossFlashAnim 0.35s ease; }
+
+@media (prefers-reduced-motion: reduce) {
+  #rpgBattleIntroFlash.rpgBossIntroPlay, .rpgBossHitShake, .rpgBossFlash {
+    animation-duration: 0.01ms !important;
+  }
+}
 
 #rpgDamagePopup {
   position: absolute;
@@ -1435,4 +2630,15 @@ button.secondary {
   .navTab { font-size: 10px; }
   #battleBarLabelsRow { font-size: 11px; }
   #battleBarYouCount, #battleBarOppCount { font-size: 14px; }
+  .matchIntroAvatarWrap { width: 52px; height: 52px; }
+  .battleBarAvatarWrap { width: 36px; height: 36px; }
+  .battleBarAvatarEmoji { font-size: 18px; }
+  .matchIntroAvatarEmoji { font-size: 24px; }
+  .matchIntroName { font-size: 12px; max-width: 90px; }
+  #matchIntroRow { gap: 10px; }
+  #rpgPlayerHeader { grid-template-columns: repeat(3, 1fr); }
+  #rpgHeaderBadge, #rpgHomeCharacterPortrait { grid-column: 1 / -1; margin: 0 auto 4px; justify-content: center; }
+  .realmHotspot { padding: 4px 6px 3px; max-width: 70px; }
+  .realmHotspotLabel { font-size: 8px; max-width: 62px; }
+  .realmHotspotEmblem svg { width: 26px; height: 26px; }
 }
