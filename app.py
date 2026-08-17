@@ -166,14 +166,17 @@ VALID_MATCH_HISTORY_VISIBILITY = {"public", "friends", "private"}
 # never silently pretend an email was sent — send_email() below logs the
 # message server-side and returns False so callers can react honestly
 # instead of the user just seeing "email sent" for an email that never left.
-SMTP_HOST = os.environ.get("SMTP_HOST")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-SMTP_FROM_ADDRESS = os.environ.get("SMTP_FROM_ADDRESS", "no-reply@visorep.app")
-EMAIL_CONFIGURED = bool(SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD)
-APP_PUBLIC_URL = os.environ.get("APP_PUBLIC_URL", "http://localhost:5000")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+RESEND_FROM_ADDRESS = os.environ.get(
+    "RESEND_FROM_ADDRESS",
+    "noreply@visorep.com"
+)
+EMAIL_CONFIGURED = bool(RESEND_API_KEY)
 
+APP_PUBLIC_URL = os.environ.get(
+    "APP_PUBLIC_URL",
+    "https://visorep.com"
+)
 # --- V1.5: RPG constants ---
 # IMPORTANT: RPG progression is a COMPLETELY SEPARATE track from both Elo
 # (competitive skill) and the existing V1.3 account XP/level (kept as-is
@@ -1318,28 +1321,39 @@ def _is_valid_email(email):
 
 
 def send_email(to_address, subject, body_text):
-    """Sends a real email via SMTP if SMTP_* env vars are configured.
-    Returns True/False for whether an email was actually dispatched — the
-    caller must NEVER tell the user "email sent" unless this returned True.
-    If not configured, logs the message server-side (useful in dev/local
-    testing) and returns False; it does NOT fabricate a successful send."""
-    if not EMAIL_CONFIGURED:
-        print(f"\n[send_email] SMTP not configured — NOT actually sent.\n  To: {to_address}\n  Subject: {subject}\n  Body:\n{body_text}\n")
+    """Send email through Resend API."""
+    if not RESEND_API_KEY:
+        print("[send_email] RESEND_API_KEY is not configured.")
         return False
+
     try:
-        import smtplib
-        from email.mime.text import MIMEText
-        msg = MIMEText(body_text)
-        msg["Subject"] = subject
-        msg["From"] = SMTP_FROM_ADDRESS
-        msg["To"] = to_address
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.sendmail(SMTP_FROM_ADDRESS, [to_address], msg.as_string())
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": RESEND_FROM_ADDRESS,
+                "to": [to_address],
+                "subject": subject,
+                "text": body_text,
+            },
+            timeout=15,
+        )
+
+        if response.status_code >= 400:
+            print(
+                f"[send_email] Resend failed "
+                f"({response.status_code}): {response.text}"
+            )
+            return False
+
+        print(f"[send_email] Email sent successfully to {to_address}")
         return True
+
     except Exception as e:
-        print(f"[send_email] FAILED to send to {to_address}: {e}")
+        print(f"[send_email] Resend request failed: {e}")
         return False
 
 
