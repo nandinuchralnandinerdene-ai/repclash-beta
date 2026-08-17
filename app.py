@@ -35,7 +35,12 @@ try:
 except ImportError:
     LIMITER_AVAILABLE = False
 
-DB_PATH = "pushup_elo.db"
+# Render's default filesystem is EPHEMERAL — anything written outside a
+# mounted Persistent Disk is wiped on every redeploy/restart. In
+# production, DB_PATH must point at a path under that disk's mount (e.g.
+# /var/data/pushup_elo.db) via this env var; the bare filename fallback
+# below is only correct for local development.
+DB_PATH = os.environ.get("DB_PATH", "pushup_elo.db")
 STARTING_ELO = 1000  # V1.10: new players now start at Silver (was 1200/"Gold" under the old table)
 K_FACTOR = 32
 MATCH_DURATION_SECONDS = 60
