@@ -88,7 +88,18 @@ const CONFIG = {
   POSE_SIDE_SWITCH_CONFIRM_FRAMES: 8, // the OTHER side must be clearly better for this many CONSECUTIVE frames before we switch
   POSE_SIDE_SWITCH_MARGIN: 0.20,      // "clearly better" = otherVis - lockedVis exceeds this, on the same 0-3 visibility-sum scale as leftVis/rightVis
   LANDMARK_SMOOTHING_ALPHA: 0.35,     // EMA weight on the new raw sample; higher = more responsive, lower = smoother/laggier
-  MAX_LANDMARK_JUMP: 0.12,            // normalized-coordinate cap on one frame's displacement for shoulder/elbow/wrist before we hold the previous point instead
+  // V1.19: was 0.12 — too tight for a genuinely FAST push-up. A person
+  // exploding through a rep can move their shoulder/elbow/wrist well over
+  // 12% of the frame between two processed inference frames (frame-to-
+  // frame gaps aren't constant — pose inference itself, not just the
+  // camera, sets the effective rate). At 0.12 that fast, correct motion
+  // kept getting misread as a "jump" and held/frozen — see
+  // LANDMARK_REACQUIRE_FRAMES below for what that did to fast reps.
+  // Raised to give real fast motion room; the SEPARATE anatomy-geometry
+  // check (ANATOMY_RATIO_TOLERANCE) still catches actual misdetections,
+  // since a wrongly-placed landmark almost always breaks arm proportions
+  // too, regardless of how far it jumped.
+  MAX_LANDMARK_JUMP: 0.22,
   ANATOMY_RATIO_TOLERANCE: 0.45,      // max fractional change (this frame vs person's own recent running-average) allowed in shoulder-elbow / elbow-wrist distance before the frame is treated as noisy
   UNSTABLE_TRACKING_FRAMES: 15,       // consecutive noisy/held frames before we surface "AI is re-locking your arm" instead of silently guessing
   // V1.17 fix: a jump/geometry "hold" used to have no way back — if the
@@ -97,7 +108,13 @@ const CONFIG = {
   // red dots never re-found the joint. This many CONSECUTIVE frames of
   // the raw sample disagreeing with the anchor is treated as a genuine
   // re-lock instead of noise, and the tracker snaps to the new position.
-  LANDMARK_REACQUIRE_FRAMES: 6,
+  // V1.19: was 6 — with a fast/continuous rep (not a return-to-frame
+  // event), every held frame freezes the angle entirely, so 6 held frames
+  // in a row could silently swallow an entire rep transition (angle
+  // never crosses DOWN_ANGLE while frozen). Combined with the
+  // MAX_LANDMARK_JUMP raise above, actual re-lock events should now be
+  // rarer AND cheaper when they do happen.
+  LANDMARK_REACQUIRE_FRAMES: 3,
 };
 
 const API = "/api";
