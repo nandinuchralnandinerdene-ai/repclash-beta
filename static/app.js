@@ -34,11 +34,24 @@ const CONFIG = {
   MIN_LIGHTING_BRIGHTNESS: 40, // 0-255 average luma; below this is flagged as too dark
 
   // --- Rep-counting reliability (root-cause fixes, not "maximum strictness") ---
-  // A state transition (up->down or down->up) must hold for this many
-  // CONSECUTIVE frames before it commits — filters single-frame pose
-  // jitter from flipping the state machine without requiring every frame
-  // to be perfect (that's a debounce window, not a stricter threshold).
-  REP_STATE_CONFIRM_FRAMES: 2,
+  // A threshold crossing must hold for this many CONSECUTIVE frames before
+  // the state actually transitions — filters single-frame pose jitter from
+  // flipping the state machine on its own. Split into two directions:
+  // V1.18: entering "down" only used to require the SAME 2-frame confirm
+  // as completing the rep — but that ate into the very short down-phase
+  // window of a genuinely fast push-up (done explosively, e.g. right at
+  // the start of a match when someone goes all-out), so the bottom
+  // position was sometimes never even confirmed before the angle bounced
+  // back up, and the rep was silently dropped before it ever reached the
+  // shoulder-movement/timing checks below. Entering "down" doesn't count
+  // anything by itself — the shoulder-movement threshold and the UP-side
+  // confirm below are what actually guard against a fake/jitter rep — so
+  // relaxing this side to 1 frame costs no protection.
+  DOWN_STATE_CONFIRM_FRAMES: 1,
+  // Completing the rep (down -> up) keeps the stricter 2-frame confirm —
+  // this is the transition that actually counts a rep, so it stays
+  // resistant to a single noisy frame flipping it.
+  UP_STATE_CONFIRM_FRAMES: 2,
   // During the "down" phase of a rep, framing/alignment may briefly drop
   // out (this many consecutive bad frames is tolerated) without
   // invalidating the rep — but a SUSTAINED loss (e.g. only head/upper
@@ -2147,14 +2160,13 @@ function detectionLoop() {
           }
         }
 
-        // Debounce: a threshold crossing must hold for REP_STATE_CONFIRM_FRAMES
-        // consecutive frames before the state actually transitions — a
-        // single noisy frame (pose jitter) can no longer flip the state
-        // machine on its own.
+        // Debounce: a threshold crossing must hold for N consecutive frames
+        // before the state actually transitions — entering "down" and
+        // completing the rep use different N (see CONFIG comments).
         if (repState === "up" && angle < CONFIG.DOWN_ANGLE) {
           pendingDownFrames += 1;
           pendingUpFrames = 0;
-          if (pendingDownFrames >= CONFIG.REP_STATE_CONFIRM_FRAMES) {
+          if (pendingDownFrames >= CONFIG.DOWN_STATE_CONFIRM_FRAMES) {
             repState = "down";
             pendingDownFrames = 0;
             downShoulderY = shoulderPx.y;
@@ -2166,7 +2178,7 @@ function detectionLoop() {
         } else if (repState === "down" && angle > CONFIG.UP_ANGLE) {
           pendingUpFrames += 1;
           pendingDownFrames = 0;
-          if (pendingUpFrames >= CONFIG.REP_STATE_CONFIRM_FRAMES) {
+          if (pendingUpFrames >= CONFIG.UP_STATE_CONFIRM_FRAMES) {
             repState = "up";
             pendingUpFrames = 0;
             const now = performance.now();
@@ -4067,7 +4079,7 @@ function rpgDetectionLoop() {
         if (rpgRepState === "up" && angle < CONFIG.DOWN_ANGLE) {
           rpgPendingDownFrames += 1;
           rpgPendingUpFrames = 0;
-          if (rpgPendingDownFrames >= CONFIG.REP_STATE_CONFIRM_FRAMES) {
+          if (rpgPendingDownFrames >= CONFIG.DOWN_STATE_CONFIRM_FRAMES) {
             rpgRepState = "down";
             rpgPendingDownFrames = 0;
             rpgDownShoulderY = shoulderPx.y;
@@ -4079,7 +4091,7 @@ function rpgDetectionLoop() {
         } else if (rpgRepState === "down" && angle > CONFIG.UP_ANGLE) {
           rpgPendingUpFrames += 1;
           rpgPendingDownFrames = 0;
-          if (rpgPendingUpFrames >= CONFIG.REP_STATE_CONFIRM_FRAMES) {
+          if (rpgPendingUpFrames >= CONFIG.UP_STATE_CONFIRM_FRAMES) {
             rpgRepState = "up";
             rpgPendingUpFrames = 0;
             const now = performance.now();
