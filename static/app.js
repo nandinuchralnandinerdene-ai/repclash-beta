@@ -78,6 +78,13 @@ const CONFIG = {
   MAX_LANDMARK_JUMP: 0.12,            // normalized-coordinate cap on one frame's displacement for shoulder/elbow/wrist before we hold the previous point instead
   ANATOMY_RATIO_TOLERANCE: 0.45,      // max fractional change (this frame vs person's own recent running-average) allowed in shoulder-elbow / elbow-wrist distance before the frame is treated as noisy
   UNSTABLE_TRACKING_FRAMES: 15,       // consecutive noisy/held frames before we surface "AI is re-locking your arm" instead of silently guessing
+  // V1.17 fix: a jump/geometry "hold" used to have no way back — if the
+  // raw sample kept landing far from the (now stale) anchor, e.g. because
+  // the person stepped out of frame and back in, it held forever and the
+  // red dots never re-found the joint. This many CONSECUTIVE frames of
+  // the raw sample disagreeing with the anchor is treated as a genuine
+  // re-lock instead of noise, and the tracker snaps to the new position.
+  LANDMARK_REACQUIRE_FRAMES: 6,
 };
 
 const API = "/api";
@@ -1699,6 +1706,8 @@ function createPoseTrackerState() {
     heldThisFrame: {},           // key -> true if this frame reused the previous smoothed point (jump/geometry rejected)
     armLen: { shoulderElbow: null, elbowWrist: null }, // slow running-average distances (normalized), this person's own baseline
     unstableStreak: 0,           // consecutive frames where a CORE point (shoulder/elbow/wrist) had to be held
+    jumpStreak: {},               // key -> consecutive frames the RAW sample has landed far from the held anchor (re-lock detector)
+    geometryFailStreak: 0,        // consecutive frames the arm geometry check has failed (re-lock detector)
   };
 }
 let pvpPoseTracker = createPoseTrackerState();
@@ -1711,6 +1720,8 @@ function resetPoseTracker(state) {
   state.heldThisFrame = {};
   state.armLen = { shoulderElbow: null, elbowWrist: null };
   state.unstableStreak = 0;
+  state.jumpStreak = {};
+  state.geometryFailStreak = 0;
 }
 
 // `lm` = the raw MediaPipe landmark array for one frame. `repStateNow` =
@@ -1741,6 +1752,8 @@ function trackPoseLandmarks(state, lm, repStateNow) {
         // a genuinely new set of joints, no continuity to preserve.
         state.smoothed = {};
         state.armLen = { shoulderElbow: null, elbowWrist: null };
+        state.jumpStreak = {};
+        state.geometryFailStreak = 0;
       }
     } else {
       state.sideSwitchStreak = 0; // needs to be SUSTAINED, not cumulative across gaps
@@ -1766,24 +1779,42 @@ function trackPoseLandmarks(state, lm, repStateNow) {
 
     let candidate = { x: raw.x, y: raw.y };
     let held = false;
+    let reacquired = false;
 
-    // Motion continuity: a real joint can't teleport frame-to-frame.
+    // Motion continuity: a real joint can't teleport frame-to-frame — BUT
+    // if the raw sample keeps landing far from the held anchor for several
+    // CONSECUTIVE frames (not just one noisy frame), that's not noise
+    // anymore — it means the person actually moved there (e.g. stepped
+    // out of frame and back in) and the old anchor is simply stale. Treat
+    // that as a genuine re-lock instead of holding forever, or this key
+    // can never recover once it starts holding.
     if (prevSmoothed && (key === "shoulder" || key === "elbow" || key === "wrist")) {
       const jump = Math.hypot(candidate.x - prevSmoothed.x, candidate.y - prevSmoothed.y);
       if (jump > CONFIG.MAX_LANDMARK_JUMP) {
-        candidate = { x: prevSmoothed.x, y: prevSmoothed.y };
-        held = true;
+        const streak = (state.jumpStreak[key] || 0) + 1;
+        state.jumpStreak[key] = streak;
+        if (streak >= CONFIG.LANDMARK_REACQUIRE_FRAMES) {
+          reacquired = true; // accept the raw candidate as-is, snap to it below
+          state.jumpStreak[key] = 0;
+        } else {
+          candidate = { x: prevSmoothed.x, y: prevSmoothed.y };
+          held = true;
+        }
+      } else {
+        state.jumpStreak[key] = 0;
       }
     }
 
-    // Temporal smoothing (EMA) — applied to whatever we're accepting
-    // this frame (the raw sample, or the held previous point).
-    const smoothed = prevSmoothed
-      ? {
+    // Temporal smoothing (EMA) — applied to whatever we're accepting this
+    // frame (the raw sample, the held previous point, or — on the frame a
+    // re-lock is confirmed — a hard snap straight to the new position
+    // rather than an EMA crawl back from the now-stale anchor).
+    const smoothed = reacquired || !prevSmoothed
+      ? candidate
+      : {
           x: CONFIG.LANDMARK_SMOOTHING_ALPHA * candidate.x + (1 - CONFIG.LANDMARK_SMOOTHING_ALPHA) * prevSmoothed.x,
           y: CONFIG.LANDMARK_SMOOTHING_ALPHA * candidate.y + (1 - CONFIG.LANDMARK_SMOOTHING_ALPHA) * prevSmoothed.y,
-        }
-      : candidate;
+        };
 
     state.smoothed[key] = smoothed;
     state.heldThisFrame[key] = held;
@@ -1812,16 +1843,30 @@ function trackPoseLandmarks(state, lm, repStateNow) {
     const seOk = geometryOk("shoulder-elbow", seDist, "shoulderElbow");
     const ewOk = geometryOk("elbow-wrist", ewDist, "elbowWrist");
     if (!seOk || !ewOk) {
-      // Geometry violated — fall back to holding elbow/wrist at their
-      // previous smoothed positions rather than feeding a physically
-      // implausible arm shape into the angle calculation.
-      ["elbow", "wrist"].forEach(key => {
-        const prevSmoothed = state.smoothed[key];
-        if (prevSmoothed) {
-          out[key] = { x: prevSmoothed.x, y: prevSmoothed.y, visibility: out[key]?.visibility || 0 };
-          state.heldThisFrame[key] = true;
-        }
-      });
+      state.geometryFailStreak += 1;
+      if (state.geometryFailStreak >= CONFIG.LANDMARK_REACQUIRE_FRAMES) {
+        // Several consecutive frames all disagree with the old baseline —
+        // the baseline itself is stale (e.g. distance-to-camera changed
+        // while the person was out of frame), not a fluke. Re-baseline to
+        // what we're actually seeing now instead of holding elbow/wrist
+        // forever against a measurement that will never match again.
+        state.armLen.shoulderElbow = seDist;
+        state.armLen.elbowWrist = ewDist;
+        state.geometryFailStreak = 0;
+      } else {
+        // Geometry violated — fall back to holding elbow/wrist at their
+        // previous smoothed positions rather than feeding a physically
+        // implausible arm shape into the angle calculation.
+        ["elbow", "wrist"].forEach(key => {
+          const prevSmoothed = state.smoothed[key];
+          if (prevSmoothed) {
+            out[key] = { x: prevSmoothed.x, y: prevSmoothed.y, visibility: out[key]?.visibility || 0 };
+            state.heldThisFrame[key] = true;
+          }
+        });
+      }
+    } else {
+      state.geometryFailStreak = 0;
     }
   }
 
