@@ -10,16 +10,8 @@ const CONFIG = {
   DOWN_ANGLE: 90,
   UP_ANGLE: 160,
   MIN_SHOULDER_MOVEMENT_RATIO: 0.025, // V1.16: was 0.035 — see note on MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO below (this is only the frame-relative fallback, rarely the active path)
-  // V1.17: was 500 — too close to the cadence of a genuinely fast push-up
-  // (competitive push-up rates can exceed 2/sec, i.e. ~<500ms down-to-down),
-  // so quick legitimate reps were being silently dropped by this debounce
-  // alone even though every other check (shoulder-movement threshold,
-  // continuous-validity, angle debounce frames) had already passed. This is
-  // a floor against double-counting ONE push-up as two (a fast bounce at
-  // the bottom re-triggering down->up), not a speed cap — the angle +
-  // shoulder-movement + frame-confirm checks above remain the actual
-  // anti-jitter/anti-fake-rep protection and are unchanged.
-  MIN_REP_INTERVAL_MS: 300,
+  // V1.20: split PvP/RPG — see below. This shared constant is GONE;
+  // replaced by PVP_MIN_REP_INTERVAL_MS / RPG_MIN_REP_INTERVAL_MS.
   MIN_LANDMARK_VISIBILITY: 0.5,
   MIN_BODY_VISIBILITY: 0.35,
   MAX_HIP_DEVIATION_RATIO: 0.13, // hip's perpendicular distance from the shoulder-ankle line, as a fraction of body length — see computeHipAlignment()
@@ -48,10 +40,25 @@ const CONFIG = {
   // confirm below are what actually guard against a fake/jitter rep — so
   // relaxing this side to 1 frame costs no protection.
   DOWN_STATE_CONFIRM_FRAMES: 1,
-  // Completing the rep (down -> up) keeps the stricter 2-frame confirm —
-  // this is the transition that actually counts a rep, so it stays
-  // resistant to a single noisy frame flipping it.
-  UP_STATE_CONFIRM_FRAMES: 2,
+  // V1.20: PvP and RPG have different products goals — PvP is a speed
+  // competition (accuracy is secondary to responsiveness), RPG is not
+  // (the player isn't racing anyone, so form/stability matters more than
+  // shaving frames). Split accordingly instead of forcing one value to
+  // serve both.
+  //
+  // PvP: 1 frame — the FIRST frame the angle clears UP_ANGLE commits the
+  // rep. A genuinely explosive push-up's up-phase can be very short; any
+  // extra confirm frame here directly adds latency/dropped-rep risk for
+  // exactly the fast reps PvP is supposed to reward. This does NOT
+  // remove rep validation — shoulderMoved (real peak displacement),
+  // repWasValidThroughout (continuous visibility during the down phase),
+  // and PVP_MIN_REP_INTERVAL_MS below are unchanged and still have to
+  // pass before a rep counts; only the "wait one more frame after the
+  // angle already cleared" tax is gone.
+  PVP_UP_STATE_CONFIRM_FRAMES: 1,
+  // RPG: unchanged at 2 — no product reason to relax it, so it keeps the
+  // extra frame of resistance to a single noisy angle spike.
+  RPG_UP_STATE_CONFIRM_FRAMES: 2,
   // During the "down" phase of a rep, framing/alignment may briefly drop
   // out (this many consecutive bad frames is tolerated) without
   // invalidating the rep — but a SUSTAINED loss (e.g. only head/upper
@@ -81,6 +88,23 @@ const CONFIG = {
   // yet validated against real camera footage — expect to tune further
   // once real push-ups are actually tested.
   MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO: 0.13,
+
+  // V1.20: MIN_REP_INTERVAL_MS split PvP/RPG — its ONLY job is stopping
+  // one physical push-up's bottom-of-rep bounce from being counted as two
+  // reps; it is a debounce floor, not a speed cap (real protection
+  // against fake/partial reps is the angle debounce + shoulderMoved peak-
+  // displacement check above, both unchanged).
+  //
+  // PvP: 150ms — was 300ms (shared value, tuned before PvP/RPG were
+  // split). PvP explicitly rewards speed, and a genuinely fast competitive
+  // push-up cadence can run under 300ms rep-to-rep, so that floor was
+  // itself capping legitimate speed. 150ms is still comfortably longer
+  // than a single bounce/oscillation at the bottom of ONE rep (which
+  // registers as a few tens of ms at most between angle samples), so
+  // double-counting protection is intact.
+  PVP_MIN_REP_INTERVAL_MS: 150,
+  // RPG: unchanged at 300ms — no product reason to relax it.
+  RPG_MIN_REP_INTERVAL_MS: 300,
 
   // --- V1.15: landmark side-lock + temporal stability (root-cause fix for
   // the shoulder/elbow/wrist "jumping between joints / switching sides"
@@ -2195,7 +2219,7 @@ function detectionLoop() {
         } else if (repState === "down" && angle > CONFIG.UP_ANGLE) {
           pendingUpFrames += 1;
           pendingDownFrames = 0;
-          if (pendingUpFrames >= CONFIG.UP_STATE_CONFIRM_FRAMES) {
+          if (pendingUpFrames >= CONFIG.PVP_UP_STATE_CONFIRM_FRAMES) {
             repState = "up";
             pendingUpFrames = 0;
             const now = performance.now();
@@ -2215,10 +2239,12 @@ function detectionLoop() {
             // right at this noisy transition instant.
             downShoulderYExtreme = Math.max(downShoulderYExtreme, Math.abs(shoulderPx.y - downShoulderY));
             const shoulderMoved = downShoulderY !== null && downShoulderYExtreme > threshold;
-            // See CONFIG.MIN_REP_INTERVAL_MS comment: this is a debounce
-            // floor against double-counting one push-up, not a speed cap —
-            // it must stay low enough that legitimately fast reps pass.
-            const enoughTimePassed = now - lastRepTimestamp > CONFIG.MIN_REP_INTERVAL_MS;
+            // See CONFIG.PVP_MIN_REP_INTERVAL_MS comment: this is a
+            // debounce floor against double-counting one push-up, not a
+            // speed cap — it must stay low enough that legitimately fast
+            // reps pass. PvP-specific (not shared with RPG) since PvP is
+            // the speed-competition mode.
+            const enoughTimePassed = now - lastRepTimestamp > CONFIG.PVP_MIN_REP_INTERVAL_MS;
             const underCeiling = pushupCount < CONFIG.MAX_PUSHUPS_60S;
 
             if (repWasValidThroughout && canCount && shoulderMoved && enoughTimePassed && underCeiling) {
@@ -4108,7 +4134,7 @@ function rpgDetectionLoop() {
         } else if (rpgRepState === "down" && angle > CONFIG.UP_ANGLE) {
           rpgPendingUpFrames += 1;
           rpgPendingDownFrames = 0;
-          if (rpgPendingUpFrames >= CONFIG.UP_STATE_CONFIRM_FRAMES) {
+          if (rpgPendingUpFrames >= CONFIG.RPG_UP_STATE_CONFIRM_FRAMES) {
             rpgRepState = "up";
             rpgPendingUpFrames = 0;
             const now = performance.now();
@@ -4117,7 +4143,7 @@ function rpgDetectionLoop() {
               : CONFIG.MIN_SHOULDER_MOVEMENT_RATIO * canvas.height;
             rpgDownShoulderYExtreme = Math.max(rpgDownShoulderYExtreme, Math.abs(shoulderPx.y - rpgDownShoulderY));
             const shoulderMoved = rpgDownShoulderY !== null && rpgDownShoulderYExtreme > threshold;
-            const enoughTimePassed = now - rpgLastRepTimestamp > CONFIG.MIN_REP_INTERVAL_MS;
+            const enoughTimePassed = now - rpgLastRepTimestamp > CONFIG.RPG_MIN_REP_INTERVAL_MS;
 
             if (rpgRepRegistrationEnabled && rpgRepWasValidThroughout && canCount && shoulderMoved && enoughTimePassed) {
               rpgLastRepTimestamp = now;
