@@ -2146,7 +2146,25 @@ button.secondary {
   background: linear-gradient(180deg, rgba(14,15,18,0.35), rgba(14,15,18,0.85) 80%);
 }
 /* Everything else on the battle screen sits above the arena backdrop. */
-#rpgBattleScreen > *:not(#rpgBattleArenaOverlay):not(#rpgBattleIntroFlash) { position: relative; z-index: 1; }
+#rpgBattleScreen > *:not(#rpgBattleArenaOverlay):not(#rpgBattleIntroFlash):not(#rpgCountdownOverlay) { position: relative; z-index: 1; }
+
+/* Battle-start countdown ("3, 2, 1, GO!") — centered overlay above
+   everything else on the battle screen, shown every time a battle begins. */
+#rpgCountdownOverlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(14, 15, 18, 0.55);
+  color: #fff;
+  font-size: 96px;
+  font-weight: 800;
+  text-shadow: 0 0 24px rgba(255, 90, 31, 0.6);
+  pointer-events: none;
+  border-radius: inherit;
+}
 
 #battleBossLabel {
   display: block;
@@ -2316,17 +2334,6 @@ button.secondary {
   padding: 16px;
   text-align: center;
 }
-#rpgCountdownOverlay {
-  position: absolute;
-  inset: 0;
-  z-index: 10;
-  background: rgba(15, 17, 21, 0.92);
-  border-radius: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-#rpgCountdownNumber { font-size: 80px; font-weight: 900; color: var(--accent); }
 #rpgRepCount { font-size: 56px; font-weight: 900; margin: 8px 0; display: inline-block; transition: transform 0.1s ease; }
 #rpgFleeBtn { margin-top: 8px; }
 
@@ -2620,6 +2627,7 @@ button.secondary {
   .heroStat { padding: var(--sp-2) 4px; }
   .heroStatValue { font-size: 16px; }
   .lbName strong { font-size: 13px; }
+  #rpgCountdownOverlay { font-size: 64px; }
 }
 
 @media (max-width: 380px) {

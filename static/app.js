@@ -10,11 +10,19 @@ const CONFIG = {
   DOWN_ANGLE: 90,
   UP_ANGLE: 160,
   MIN_SHOULDER_MOVEMENT_RATIO: 0.025, // V1.16: was 0.035 — see note on MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO below (this is only the frame-relative fallback, rarely the active path)
-  MIN_REP_INTERVAL_MS: 500,
+  // V1.17: was 500 — too close to the cadence of a genuinely fast push-up
+  // (competitive push-up rates can exceed 2/sec, i.e. ~<500ms down-to-down),
+  // so quick legitimate reps were being silently dropped by this debounce
+  // alone even though every other check (shoulder-movement threshold,
+  // continuous-validity, angle debounce frames) had already passed. This is
+  // a floor against double-counting ONE push-up as two (a fast bounce at
+  // the bottom re-triggering down->up), not a speed cap — the angle +
+  // shoulder-movement + frame-confirm checks above remain the actual
+  // anti-jitter/anti-fake-rep protection and are unchanged.
+  MIN_REP_INTERVAL_MS: 300,
   MIN_LANDMARK_VISIBILITY: 0.5,
   MIN_BODY_VISIBILITY: 0.35,
   MAX_HIP_DEVIATION_RATIO: 0.13, // hip's perpendicular distance from the shoulder-ankle line, as a fraction of body length — see computeHipAlignment()
-  MANUAL_TAP_COOLDOWN_MS: 500,
   MAX_PUSHUPS_60S: 150,
   FEEDBACK_MIN_DISPLAY_MS: 800,
   POSE_MODEL_TIMEOUT_MS: 15000,
@@ -22,6 +30,7 @@ const CONFIG = {
   READY_POLL_MS: 1000,
   REMATCH_POLL_MS: 1500,
   CAMERA_READY_STABILITY_MS: 1000, // all conditions must hold continuously this long before auto-ready fires
+  RPG_COUNTDOWN_STEP_MS: 700, // duration each of "3", "2", "1", "GO!" is shown for
   MIN_LIGHTING_BRIGHTNESS: 40, // 0-255 average luma; below this is flagged as too dark
 
   // --- Rep-counting reliability (root-cause fixes, not "maximum strictness") ---
@@ -81,7 +90,6 @@ let readyPollInterval = null;
 let rematchPollInterval = null;
 let waitingSecondsElapsed = 0;
 let pushupCount = 0;
-let manualTapCooldownUntil = 0;
 let currentOpponent = null;
 let iAmPlayer1 = null;
 
@@ -1935,7 +1943,6 @@ async function startCamera() {
   flatZStreak = 0;
   livenessWarningShown = false;
   resetPoseTracker(pvpPoseTracker);
-  setManualButtonEnabled(false);
 
   try {
     statusEl.textContent = "📷 Starting camera…";
@@ -1959,15 +1966,11 @@ async function startCamera() {
     statusEl.classList.add("hidden");
   } catch (err) {
     console.error("Camera/pose init failed:", err);
-    statusEl.textContent = "⚠️ AI counting unavailable — use the Add Rep Manually button";
-    setManualButtonEnabled(true);
+    // No manual fallback — camera/AI detection is the only way to
+    // register a rep, so if it can't start, reps simply can't be
+    // registered until the camera becomes available again.
+    statusEl.textContent = "⚠️ Camera/AI counting unavailable — reps can't be counted until it's working.";
   }
-}
-
-function setManualButtonEnabled(enabled) {
-  const btn = document.getElementById("manualAddBtn");
-  btn.disabled = !enabled;
-  btn.classList.toggle("navDisabled", !enabled);
 }
 
 function stopCamera() {
@@ -2138,6 +2141,9 @@ function detectionLoop() {
             // right at this noisy transition instant.
             downShoulderYExtreme = Math.max(downShoulderYExtreme, Math.abs(shoulderPx.y - downShoulderY));
             const shoulderMoved = downShoulderY !== null && downShoulderYExtreme > threshold;
+            // See CONFIG.MIN_REP_INTERVAL_MS comment: this is a debounce
+            // floor against double-counting one push-up, not a speed cap —
+            // it must stay low enough that legitimately fast reps pass.
             const enoughTimePassed = now - lastRepTimestamp > CONFIG.MIN_REP_INTERVAL_MS;
             const underCeiling = pushupCount < CONFIG.MAX_PUSHUPS_60S;
 
@@ -2180,16 +2186,6 @@ function detectionLoop() {
 
   requestAnimationFrame(detectionLoop);
 }
-
-document.getElementById("manualAddBtn").addEventListener("click", () => {
-  const now = performance.now();
-  if (now < manualTapCooldownUntil) return;
-  if (pushupCount >= CONFIG.MAX_PUSHUPS_60S) return;
-  manualTapCooldownUntil = now + CONFIG.MANUAL_TAP_COOLDOWN_MS;
-  pushupCount += 1;
-  document.getElementById("pushupCount").textContent = pushupCount;
-  playBeep(660, 0.08);
-});
 
 async function finishMatch() {
   document.getElementById("myFinalCount").textContent = pushupCount;
@@ -3776,11 +3772,16 @@ function enterRpgBattle(encounterId, monsterName, difficulty, isBoss, monsterHp,
   }
 
   showScreen("rpgBattle");
-  ensureCameraSetupThenProceed(async () => {
+  // V1.17: no separate RPG camera-setup/check screen anymore — go straight
+  // into the battle screen, initialize the camera, then run the 3-2-1-GO!
+  // countdown before rep registration turns on (see runRpgCountdown).
+  // PvP's own camera-check flow (startReadyCameraCheck) is untouched.
+  (async () => {
     await startRpgCamera();
     rpgDetectionRunning = true;
     requestAnimationFrame(rpgDetectionLoop);
-  });
+    await runRpgCountdown();
+  })();
 }
 let rpgIsBossBattle = false;
 
@@ -3826,9 +3827,21 @@ let rpgLastFeedbackChangeTime = 0;
 let rpgFlatZStreak = 0;
 let rpgLivenessWarningShown = false;
 
-async function startRpgCamera() {
-  const video = document.getElementById("rpgCameraVideo");
-  const statusEl = document.getElementById("rpgCameraStatus");
+// Gates whether a detected (or, formerly, manually-tapped) rep is actually
+// allowed to register. False for the whole battle-start countdown so a
+// pose transition during "3, 2, 1" can never become the first counted rep;
+// flipped true only once the countdown reaches "GO!" (see runRpgCountdown).
+let rpgRepRegistrationEnabled = false;
+// Bumped whenever the current battle/camera session ends (flee, defeat,
+// or a new battle starting) so a countdown left over from a battle the
+// player already exited can't reach into a later session and flip
+// rpgRepRegistrationEnabled back on after the fact.
+let rpgCountdownToken = 0;
+
+// Pulled out of startRpgCamera so the countdown can also call it right
+// before "GO!" — discards any state a pose transition during the
+// countdown may have left behind, so the battle always starts clean.
+function resetRpgRepDetectionState() {
   rpgRepState = "up";
   rpgDownShoulderY = null;
   rpgDownShoulderYExtreme = 0;
@@ -3841,7 +3854,12 @@ async function startRpgCamera() {
   rpgFlatZStreak = 0;
   rpgLivenessWarningShown = false;
   resetPoseTracker(rpgPoseTracker);
-  setRpgManualButtonEnabled(false);
+}
+
+async function startRpgCamera() {
+  const video = document.getElementById("rpgCameraVideo");
+  const statusEl = document.getElementById("rpgCameraStatus");
+  resetRpgRepDetectionState();
 
   try {
     statusEl.textContent = "📷 Starting camera…";
@@ -3862,19 +3880,43 @@ async function startRpgCamera() {
     statusEl.classList.add("hidden");
   } catch (err) {
     console.error("RPG camera/pose init failed:", err);
-    statusEl.textContent = "⚠️ Camera unavailable — use Add Rep Manually below";
-    setRpgManualButtonEnabled(true);
+    // No manual fallback — camera/AI detection is the only way to
+    // register a rep, same rule as PvP.
+    statusEl.textContent = "⚠️ Camera unavailable — reps can't be counted until it's working.";
   }
 }
 
-function setRpgManualButtonEnabled(enabled) {
-  const btn = document.getElementById("rpgManualAddBtn");
-  btn.disabled = !enabled;
-  btn.classList.toggle("navDisabled", !enabled);
+// Runs the 3-2-1-GO! overlay. Called every time a battle screen is
+// entered (new battle, continue, or resume-after-refresh all funnel
+// through enterRpgBattle), after the camera/pose model has initialized.
+// The AI may already be tracking pose during this — that's fine, it just
+// can't register a rep yet (rpgRepRegistrationEnabled stays false).
+async function runRpgCountdown() {
+  const overlay = document.getElementById("rpgCountdownOverlay");
+  rpgRepRegistrationEnabled = false;
+  const myToken = ++rpgCountdownToken;
+  if (!overlay) { rpgRepRegistrationEnabled = true; return; }
+
+  overlay.classList.remove("hidden");
+  const steps = ["3", "2", "1", "GO!"];
+  for (const step of steps) {
+    if (myToken !== rpgCountdownToken) return; // superseded — battle was left/replaced mid-countdown
+    overlay.textContent = step;
+    playBeep(step === "GO!" ? 880 : 440, 0.12);
+    await new Promise(resolve => setTimeout(resolve, CONFIG.RPG_COUNTDOWN_STEP_MS));
+  }
+  if (myToken !== rpgCountdownToken) return;
+  overlay.classList.add("hidden");
+
+  // Clean slate right before enabling counting — see function comment above.
+  resetRpgRepDetectionState();
+  rpgRepRegistrationEnabled = true;
 }
 
 function stopRpgCamera() {
   rpgDetectionRunning = false;
+  rpgRepRegistrationEnabled = false;
+  rpgCountdownToken++; // invalidate any in-flight countdown for this session
   setCameraActiveIndicator("rpgCameraActiveIndicator", false);
   hidePoseDebugOverlay("rpgPoseDebug");
   if (rpgCameraStream) {
@@ -4003,12 +4045,13 @@ function rpgDetectionLoop() {
             const shoulderMoved = rpgDownShoulderY !== null && rpgDownShoulderYExtreme > threshold;
             const enoughTimePassed = now - rpgLastRepTimestamp > CONFIG.MIN_REP_INTERVAL_MS;
 
-            if (rpgRepWasValidThroughout && canCount && shoulderMoved && enoughTimePassed) {
+            if (rpgRepRegistrationEnabled && rpgRepWasValidThroughout && canCount && shoulderMoved && enoughTimePassed) {
               rpgLastRepTimestamp = now;
               registerRpgRep();
               lastRpgRepRejectedReason = null;
             } else if (isPoseDebugEnabled()) {
-              if (!rpgRepWasValidThroughout) lastRpgRepRejectedReason = "lost tracking/visibility during the down phase";
+              if (!rpgRepRegistrationEnabled) lastRpgRepRejectedReason = "countdown not finished yet";
+              else if (!rpgRepWasValidThroughout) lastRpgRepRejectedReason = "lost tracking/visibility during the down phase";
               else if (!shoulderMoved) lastRpgRepRejectedReason = `shoulder movement too small (${(rpgDownShoulderYExtreme / canvas.height).toFixed(3)} < ${(threshold / canvas.height).toFixed(3)})`;
               else if (!enoughTimePassed) lastRpgRepRejectedReason = "too soon after the previous rep";
               else lastRpgRepRejectedReason = "angle never reached UP threshold cleanly";
@@ -4033,13 +4076,6 @@ function rpgDetectionLoop() {
 
   requestAnimationFrame(rpgDetectionLoop);
 }
-
-document.getElementById("rpgManualAddBtn").addEventListener("click", () => {
-  const now = performance.now();
-  if (now < manualTapCooldownUntil) return;
-  manualTapCooldownUntil = now + CONFIG.MANUAL_TAP_COOLDOWN_MS;
-  registerRpgRep();
-});
 
 // ---------------------------------------------------------------- rep -> damage submission
 // IMPORTANT: each valid rep queues exactly ONE unit, flushed to the server

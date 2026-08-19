@@ -293,8 +293,12 @@
 
       <div id="rpgRepCount">0</div>
       <p class="hint" id="rpgDetectionHint">Stand sideways in front of the camera.</p>
-      <button id="rpgManualAddBtn" class="secondary">➕ Add Rep Manually (if camera fails)</button>
       <button id="rpgFleeBtn" class="secondary">🏃 Leave Battle (progress is saved)</button>
+
+      <!-- Battle-start countdown overlay: shown every time a battle begins,
+           right after the camera initializes. Rep registration stays
+           disabled (see app.js) until this reaches "GO!". -->
+      <div id="rpgCountdownOverlay" class="hidden" aria-live="assertive"></div>
     </section>
 
     <!-- 2j. Camera Setup Onboarding (shown once before first AI exercise) -->
@@ -813,8 +817,6 @@
       <p class="hint" id="detectionHint">
         Stand sideways in front of the camera — the counter increases automatically.
       </p>
-
-      <button id="manualAddBtn" class="secondary">➕ Add Rep Manually (if camera fails)</button>
     </section>
 
     <!-- 6. Waiting for opponent's result -->
