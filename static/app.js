@@ -112,6 +112,20 @@ const CONFIG = {
   POSE_SIDE_SWITCH_CONFIRM_FRAMES: 8, // the OTHER side must be clearly better for this many CONSECUTIVE frames before we switch
   POSE_SIDE_SWITCH_MARGIN: 0.20,      // "clearly better" = otherVis - lockedVis exceeds this, on the same 0-3 visibility-sum scale as leftVis/rightVis
   LANDMARK_SMOOTHING_ALPHA: 0.35,     // EMA weight on the new raw sample; higher = more responsive, lower = smoother/laggier
+  // V1.21: below-noise-floor frame-to-frame movement is NOT real motion —
+  // it's the pose model's own small estimation variance, and it's the
+  // main visible cause of the elbow dot specifically "wobbling in place"
+  // while the joint is actually still. The elbow is the hardest of the
+  // three to localize precisely: unlike the shoulder (torso-anchored,
+  // visually distinct) or the wrist (a clear end-of-limb feature), it's a
+  // mid-limb point that's often partially foreshortened/occluded by the
+  // torso in this app's side-on framing, so its raw estimate is noisier
+  // frame to frame even standing still. Below this threshold, treat the
+  // sample as "didn't move" and hold the exact previous point instead of
+  // letting that noise floor show up as a visible jitter. This adds ZERO
+  // lag to real movement — genuine motion clears this tiny threshold on
+  // the very first frame it happens, same as before.
+  MICRO_JITTER_DEADZONE: 0.01,
   // V1.19: was 0.12 — too tight for a genuinely FAST push-up. A person
   // exploding through a rep can move their shoulder/elbow/wrist well over
   // 12% of the frame between two processed inference frames (frame-to-
@@ -1843,8 +1857,13 @@ function trackPoseLandmarks(state, lm, repStateNow) {
     // that as a genuine re-lock instead of holding forever, or this key
     // can never recover once it starts holding.
     if (prevSmoothed && (key === "shoulder" || key === "elbow" || key === "wrist")) {
-      const jump = Math.hypot(candidate.x - prevSmoothed.x, candidate.y - prevSmoothed.y);
-      if (jump > CONFIG.MAX_LANDMARK_JUMP) {
+      const delta = Math.hypot(candidate.x - prevSmoothed.x, candidate.y - prevSmoothed.y);
+      if (delta < CONFIG.MICRO_JITTER_DEADZONE) {
+        // See CONFIG.MICRO_JITTER_DEADZONE comment — sub-noise-floor
+        // movement, pin exactly to the previous point instead of letting
+        // the model's own variance read as a wobble.
+        candidate = { x: prevSmoothed.x, y: prevSmoothed.y };
+      } else if (delta > CONFIG.MAX_LANDMARK_JUMP) {
         const streak = (state.jumpStreak[key] || 0) + 1;
         state.jumpStreak[key] = streak;
         if (streak >= CONFIG.LANDMARK_REACQUIRE_FRAMES) {
