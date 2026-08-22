@@ -12,9 +12,17 @@ const CONFIG = {
   MIN_SHOULDER_MOVEMENT_RATIO: 0.025, // V1.16: was 0.035 — see note on MIN_SHOULDER_MOVEMENT_RATIO_OF_TORSO below (this is only the frame-relative fallback, rarely the active path)
   // V1.20: split PvP/RPG — see below. This shared constant is GONE;
   // replaced by PVP_MIN_REP_INTERVAL_MS / RPG_MIN_REP_INTERVAL_MS.
-  MIN_LANDMARK_VISIBILITY: 0.5,
+  // V1.21: real-world evidence (multiple debug-overlay-confirmed test
+  // sessions) showed these were rejecting the MAJORITY of genuine push-ups
+  // — not occasional edge cases. A rep-validation system that a real user
+  // can't clear most of the time is miscalibrated, full stop, regardless
+  // of whether each individual rejection was "technically correct" per
+  // its own threshold. Loosened below; the actual anti-cheat backbone
+  // (shoulder-movement peak displacement, angle debounce, min rep
+  // interval) is UNCHANGED and still blocks fake/partial reps.
+  MIN_LANDMARK_VISIBILITY: 0.4, // was 0.5 — MediaPipe confidence dips briefly during normal fast movement / self-occlusion; this was voiding real reps over normal noise
   MIN_BODY_VISIBILITY: 0.35,
-  MAX_HIP_DEVIATION_RATIO: 0.13, // hip's perpendicular distance from the shoulder-ankle line, as a fraction of body length — see computeHipAlignment()
+  MAX_HIP_DEVIATION_RATIO: 0.20, // was 0.13 — 13% was closer to "fitness-model-perfect plank" than "real person's push-up"; 20% still catches genuinely bad form (sagging/piking hard) without flagging normal human wobble
   MAX_PUSHUPS_60S: 150,
   FEEDBACK_MIN_DISPLAY_MS: 800,
   POSE_MODEL_TIMEOUT_MS: 15000,
@@ -66,7 +74,16 @@ const CONFIG = {
   // if visibility happens to look fine again by the moment the rep
   // completes. This is what "canCount checked only at the final frame"
   // was missing.
-  REP_VALIDITY_GRACE_FRAMES: 3,
+  // V1.21: was 3 — across multiple real debug-overlay-confirmed sessions,
+  // "lost tracking/visibility during the down phase" was BY FAR the most
+  // common rejection reason, voiding genuine full-depth reps over what is
+  // normal, brief MediaPipe confidence noise (self-occlusion at the
+  // bottom of a rep, motion blur, etc.) — not actual sustained tracking
+  // loss. 3 frames (~100-150ms at typical inference rates) is too tight a
+  // window for that noise. Raised to tolerate a real brief dip while
+  // still catching genuinely sustained loss (e.g. walking out of frame
+  // mid-rep, which lasts far longer than this).
+  REP_VALIDITY_GRACE_FRAMES: 8,
   // Estimated fraction of the person's own shoulder-to-hip pixel distance
   // (not a fixed fraction of the raw video frame) the shoulder must move
   // vertically for a rep to count. Normalizing by body scale means the
@@ -112,6 +129,20 @@ const CONFIG = {
   POSE_SIDE_SWITCH_CONFIRM_FRAMES: 8, // the OTHER side must be clearly better for this many CONSECUTIVE frames before we switch
   POSE_SIDE_SWITCH_MARGIN: 0.20,      // "clearly better" = otherVis - lockedVis exceeds this, on the same 0-3 visibility-sum scale as leftVis/rightVis
   LANDMARK_SMOOTHING_ALPHA: 0.35,     // EMA weight on the new raw sample; higher = more responsive, lower = smoother/laggier
+  // V1.21: below-noise-floor frame-to-frame movement is NOT real motion —
+  // it's the pose model's own small estimation variance, and it's the
+  // main visible cause of the elbow dot specifically "wobbling in place"
+  // while the joint is actually still. The elbow is the hardest of the
+  // three to localize precisely: unlike the shoulder (torso-anchored,
+  // visually distinct) or the wrist (a clear end-of-limb feature), it's a
+  // mid-limb point that's often partially foreshortened/occluded by the
+  // torso in this app's side-on framing, so its raw estimate is noisier
+  // frame to frame even standing still. Below this threshold, treat the
+  // sample as "didn't move" and hold the exact previous point instead of
+  // letting that noise floor show up as a visible jitter. This adds ZERO
+  // lag to real movement — genuine motion clears this tiny threshold on
+  // the very first frame it happens, same as before.
+  MICRO_JITTER_DEADZONE: 0.01,
   // V1.19: was 0.12 — too tight for a genuinely FAST push-up. A person
   // exploding through a rep can move their shoulder/elbow/wrist well over
   // 12% of the frame between two processed inference frames (frame-to-
@@ -1843,8 +1874,13 @@ function trackPoseLandmarks(state, lm, repStateNow) {
     // that as a genuine re-lock instead of holding forever, or this key
     // can never recover once it starts holding.
     if (prevSmoothed && (key === "shoulder" || key === "elbow" || key === "wrist")) {
-      const jump = Math.hypot(candidate.x - prevSmoothed.x, candidate.y - prevSmoothed.y);
-      if (jump > CONFIG.MAX_LANDMARK_JUMP) {
+      const delta = Math.hypot(candidate.x - prevSmoothed.x, candidate.y - prevSmoothed.y);
+      if (delta < CONFIG.MICRO_JITTER_DEADZONE) {
+        // See CONFIG.MICRO_JITTER_DEADZONE comment — sub-noise-floor
+        // movement, pin exactly to the previous point instead of letting
+        // the model's own variance read as a wobble.
+        candidate = { x: prevSmoothed.x, y: prevSmoothed.y };
+      } else if (delta > CONFIG.MAX_LANDMARK_JUMP) {
         const streak = (state.jumpStreak[key] || 0) + 1;
         state.jumpStreak[key] = streak;
         if (streak >= CONFIG.LANDMARK_REACQUIRE_FRAMES) {
